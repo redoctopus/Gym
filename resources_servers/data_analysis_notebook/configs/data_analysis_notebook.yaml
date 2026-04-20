@@ -1,0 +1,25 @@
+data_analysis_notebook:
+  resources_servers:
+    data_analysis_notebook:
+      entrypoint: app.py
+      domain: coding
+      verified: false
+      description: Data analysis tasks verified by executing reference vs predicted notebook cells
+      max_concurrent_executions: 2
+      execute_timeout_secs: 120
+      wall_clock_margin_secs: 90
+      image_compare_mode: exact
+data_analysis_notebook_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: data_analysis_notebook
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: resources_servers/data_analysis_notebook/data/example.jsonl
