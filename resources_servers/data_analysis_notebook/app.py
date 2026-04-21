@@ -22,6 +22,7 @@ import queue
 import re
 import shutil
 from asyncio import Semaphore, get_running_loop
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -55,7 +56,6 @@ class VerifierMetadata(BaseModel):
     """Fields expected under verifier_metadata for this server."""
 
     reference_notebook: dict[str, Any]
-    data_files: Optional[dict[str, str]] = None
     data_paths: Optional[list[dict[str, str]]] = None
 
 
@@ -80,6 +80,31 @@ class DataAnalysisNotebookVerifyResponse(BaseVerifyResponse):
     num_predicted_code_cells: int = 0
 
 
+def _verify_response(
+    body: DataAnalysisNotebookVerifyRequest,
+    *,
+    reward: float,
+    match: bool = False,
+    comparison_detail: Optional[str] = None,
+    reference_execution_error: Optional[str] = None,
+    predicted_execution_error: Optional[str] = None,
+    reference_merged_output: Optional[dict[str, Any]] = None,
+    num_reference_code_cells: int = 0,
+    num_predicted_code_cells: int = 0,
+) -> DataAnalysisNotebookVerifyResponse:
+    return DataAnalysisNotebookVerifyResponse(
+        **body.model_dump(),
+        reward=reward,
+        match=match,
+        comparison_detail=comparison_detail,
+        reference_execution_error=reference_execution_error,
+        predicted_execution_error=predicted_execution_error,
+        reference_merged_output=reference_merged_output,
+        num_reference_code_cells=num_reference_code_cells,
+        num_predicted_code_cells=num_predicted_code_cells,
+    )
+
+
 def _strip_thinking(text: str) -> str:
     if "</think>" in text:
         text = _THINKING_SPLIT_RE.split(text)[-1]
@@ -102,7 +127,12 @@ def extract_predicted_code_cells(text: str) -> list[str]:
     """Ordered Python cells from ```python ... ``` fences."""
     if not text or not text.strip():
         return []
-    return [m.group(1).strip() for m in _CODE_FENCE_RE.finditer(text) if m.group(1).strip()]
+    cells: list[str] = []
+    for m in _CODE_FENCE_RE.finditer(text):
+        block = m.group(1).strip()
+        if block:
+            cells.append(block)
+    return cells
 
 
 def extract_reference_code_sources(reference_notebook: dict[str, Any]) -> list[str]:
@@ -118,22 +148,6 @@ def extract_reference_code_sources(reference_notebook: dict[str, Any]) -> list[s
         if src:
             sources.append(src)
     return sources
-
-
-def _stage_data_files(target: Path, data_files: Optional[dict[str, str]]) -> Optional[str]:
-    if not data_files:
-        return None
-    try:
-        for rel, content in data_files.items():
-            path = target / rel
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if isinstance(content, str) and content.startswith("base64:"):
-                path.write_bytes(base64.b64decode(content[7:]))
-            else:
-                path.write_text(content if isinstance(content, str) else str(content), encoding="utf-8")
-    except (OSError, ValueError, TypeError) as e:
-        return f"data_files staging failed: {e}"
-    return None
 
 
 def _stage_data_paths(target: Path, data_paths: Optional[list[dict[str, str]]]) -> Optional[str]:
@@ -196,10 +210,7 @@ def _canonicalize_cell_outputs(cell: NotebookNode) -> list[dict[str, Any]]:
                 records.append({"kind": "plain", "text": _normalize_text(plain)})
             png = data.get("image/png")
             if png is not None:
-                if isinstance(png, str):
-                    png_b64 = png
-                else:
-                    png_b64 = base64.b64encode(png).decode("ascii")
+                png_b64 = png if isinstance(png, str) else base64.b64encode(png).decode("ascii")
                 records.append({"kind": "png", "data": png_b64})
     return records
 
@@ -300,7 +311,6 @@ def execute_notebook_cells_process(
 
 def _run_staging_and_execute(
     sources: list[str],
-    data_files: Optional[dict[str, str]],
     data_paths: Optional[list[dict[str, str]]],
     timeout: int,
     wall_margin: int,
@@ -309,9 +319,6 @@ def _run_staging_and_execute(
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
-        err = _stage_data_files(cwd, data_files)
-        if err:
-            return None, err
         err = _stage_data_paths(cwd, data_paths)
         if err:
             return None, err
@@ -326,47 +333,37 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
 
     async def verify(self, body: DataAnalysisNotebookVerifyRequest) -> DataAnalysisNotebookVerifyResponse:
         if not body.verifier_metadata:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 comparison_detail="verifier_metadata is missing",
-                num_reference_code_cells=0,
-                num_predicted_code_cells=0,
             )
         try:
             meta = VerifierMetadata.model_validate(body.verifier_metadata)
         except ValidationError as e:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 comparison_detail=f"invalid verifier_metadata: {e}"[:2000],
-                num_reference_code_cells=0,
-                num_predicted_code_cells=0,
             )
         ref_sources = extract_reference_code_sources(meta.reference_notebook)
         pred_text = _assistant_output_text(body.response)
         pred_sources = extract_predicted_code_cells(pred_text)
 
         if not ref_sources:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 comparison_detail="reference notebook has no code cells",
-                num_reference_code_cells=0,
                 num_predicted_code_cells=len(pred_sources),
             )
 
         if not pred_sources:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 comparison_detail="model output has no python code fences",
                 num_reference_code_cells=len(ref_sources),
-                num_predicted_code_cells=0,
             )
 
         loop = get_running_loop()
@@ -374,33 +371,20 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         margin = self.config.wall_clock_margin_secs
         image_mode = self.config.image_compare_mode
 
+        run_staged = partial(
+            _run_staging_and_execute,
+            data_paths=meta.data_paths,
+            timeout=timeout,
+            wall_margin=margin,
+        )
         async with self._semaphore:
-            ref_nb, ref_err = await loop.run_in_executor(
-                None,
-                lambda: _run_staging_and_execute(
-                    ref_sources,
-                    meta.data_files,
-                    meta.data_paths,
-                    timeout,
-                    margin,
-                ),
-            )
-            pred_nb, pred_err = await loop.run_in_executor(
-                None,
-                lambda: _run_staging_and_execute(
-                    pred_sources,
-                    meta.data_files,
-                    meta.data_paths,
-                    timeout,
-                    margin,
-                ),
-            )
+            ref_nb, ref_err = await loop.run_in_executor(None, partial(run_staged, ref_sources))
+            pred_nb, pred_err = await loop.run_in_executor(None, partial(run_staged, pred_sources))
 
         if ref_err:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 reference_execution_error=ref_err[:2000],
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),
@@ -410,10 +394,9 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         sig_ref = merged_output_signature(ref_nb, image_mode)
 
         if pred_err:
-            return DataAnalysisNotebookVerifyResponse(
-                **body.model_dump(),
+            return _verify_response(
+                body,
                 reward=0.0,
-                match=False,
                 predicted_execution_error=pred_err[:2000],
                 reference_merged_output=sig_ref,
                 num_reference_code_cells=len(ref_sources),
@@ -427,8 +410,8 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         if not ok:
             detail = json.dumps({"reference": sig_ref, "predicted": sig_pred}, default=str)[:4000]
 
-        return DataAnalysisNotebookVerifyResponse(
-            **body.model_dump(),
+        return _verify_response(
+            body,
             reward=1.0 if ok else 0.0,
             match=ok,
             comparison_detail=detail,

@@ -212,24 +212,6 @@ class TestVerifyIntegration:
         assert res.reference_merged_output is not None
         assert res.reference_merged_output["text_merged"] == "1"
 
-    async def test_verify_with_data_files(self, dan_verify_client: TestClient) -> None:
-        ref = "import pathlib\nprint(pathlib.Path('toy.csv').read_text().strip())"
-        pred = "```python\nimport pathlib\nprint(pathlib.Path('toy.csv').read_text().strip())\n```"
-        body = DataAnalysisNotebookVerifyRequest(
-            responses_create_params={
-                "input": [{"role": "user", "content": "Read toy.csv"}],
-                "parallel_tool_calls": False,
-            },
-            response=_assistant_response(pred),
-            verifier_metadata={
-                "reference_notebook": _ref_nb(ref),
-                "data_files": {"toy.csv": "x,y\n1,2"},
-            },
-        )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
-        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
-        assert res.reward == 1.0
-
     async def test_verify_with_data_paths(self, dan_verify_client: TestClient) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
             f.write("k,v\n9,9\n")
