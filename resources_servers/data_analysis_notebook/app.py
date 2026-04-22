@@ -27,7 +27,10 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import nbformat
+from jupyter_client.utils import ensure_async
+from jupyter_core.utils import run_sync
 from nbclient import NotebookClient
+from nbclient.exceptions import CellTimeoutError
 from nbformat.notebooknode import NotebookNode
 from pydantic import BaseModel, Field, ValidationError
 
@@ -255,24 +258,109 @@ def merged_signatures_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return a == b
 
 
-def _notebook_worker(cwd_str: str, sources: list[str], timeout: int, result_queue: multiprocessing.Queue) -> None:
+# Lines of prior stdout/plain/stderr to include when a code cell times out.
+_PREVIOUS_OUTPUT_PREVIEW_LINES = 5
+_REFERENCE_EXEC_ERR_MAX_CHARS = 5000
+
+
+def _previous_output_excerpt(nb: NotebookNode, failing_code_cell_index: int, max_lines: int) -> str:
+    """Last lines of merged output from code cells before ``failing_code_cell_index``."""
+    if failing_code_cell_index <= 0 or not nb.cells:
+        return "(no output from previous code cells)"
+    pnb = nbformat.v4.new_notebook()
+    pnb.metadata = dict(nb.get("metadata") or {})
+    pnb.cells = nb.cells[:failing_code_cell_index]
+    try:
+        sig = merged_output_signature(pnb, "none")
+    except Exception:  # pragma: no cover - defensive
+        return "(could not collect output from previous code cells)"
+    parts: list[str] = []
+    t = (sig.get("text_merged") or "").strip()
+    s = (sig.get("stderr_merged") or "").strip()
+    if t:
+        parts.append(t)
+    if s:
+        parts.append(s)
+    blob = "\n".join(parts) if parts else "(empty output from previous code cells)"
+    lines = blob.split("\n")
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "...\n" + "\n".join(lines[-max_lines:])
+
+
+def _format_cell_timeout_error(
+    code_cell_index: int,
+    nb: NotebookNode,
+    original_exc: CellTimeoutError,
+) -> str:
+    excerpt = _previous_output_excerpt(nb, code_cell_index, _PREVIOUS_OUTPUT_PREVIEW_LINES)
+    return (
+        f"Code cell index {code_cell_index} (0-based) timed out after execute_timeout_secs "
+        f"({_PREVIOUS_OUTPUT_PREVIEW_LINES} lines of prior output at most, stdout+stderr):\n"
+        f"{excerpt}\n"
+        f"---\n{original_exc!s}"
+    )
+
+
+async def _async_execute_code_cells(
+    cwd: Path,
+    sources: list[str],
+    timeout: int,
+) -> tuple[Optional[NotebookNode], Optional[str]]:
     import os
+
+    os.environ["MPLBACKEND"] = "Agg"
+    os.chdir(cwd)
+    nb = nbformat.v4.new_notebook()
+    for src in sources:
+        nb.cells.append(nbformat.v4.new_code_cell(source=src))
+    client = NotebookClient(
+        nb,
+        timeout=timeout,
+        kernel_name="python3",
+        resources={"metadata": {"path": str(cwd)}},
+    )
+    client.reset_execution_trackers()
+    async with client.async_setup_kernel():
+        assert client.kc is not None
+        client.log.info("Executing notebook with kernel: %s" % client.kernel_name)
+        msg_id = await ensure_async(client.kc.kernel_info())
+        info_msg = await client.async_wait_for_reply(msg_id)
+        if info_msg is not None:
+            if "language_info" in info_msg["content"]:
+                client.nb.metadata["language_info"] = info_msg["content"]["language_info"]
+            else:
+                raise RuntimeError(
+                    'Kernel info received message content has no "language_info" key. '
+                    "Content is:\n" + str(info_msg["content"])
+                )
+        for index, cell in enumerate(client.nb.cells):
+            try:
+                await client.async_execute_cell(cell, index, execution_count=client.code_cells_executed + 1)
+            except CellTimeoutError as e:
+                return None, _format_cell_timeout_error(index, client.nb, e)
+        client.set_widgets_metadata()
+    return client.nb, None
+
+
+@run_sync
+async def _execute_notebook_with_timeout_error_detail(
+    cwd: Path, sources: list[str], timeout: int
+) -> tuple[Optional[NotebookNode], Optional[str]]:
+    """Run cells like nbclient.execute(), but return structured timeout errors (see async impl)."""
+    return await _async_execute_code_cells(cwd, sources, timeout)
+
+
+def _notebook_worker(cwd_str: str, sources: list[str], timeout: int, result_queue: multiprocessing.Queue) -> None:
     from pathlib import Path
 
-    cwd = Path(cwd_str)
-    os.environ["MPLBACKEND"] = "Agg"
     try:
-        os.chdir(cwd)
-        nb = nbformat.v4.new_notebook()
-        for src in sources:
-            nb.cells.append(nbformat.v4.new_code_cell(source=src))
-        client = NotebookClient(
-            nb,
-            timeout=timeout,
-            kernel_name="python3",
-            resources={"metadata": {"path": str(cwd)}},
-        )
-        client.execute()
+        cwd = Path(cwd_str)
+        nb, err = _execute_notebook_with_timeout_error_detail(cwd, sources, timeout)
+        if err is not None:
+            result_queue.put(("err", err))
+            return
+        assert nb is not None
         result_queue.put(("ok", nbformat.writes(nb)))
     except Exception as e:
         result_queue.put(("err", f"{type(e).__name__}: {e}"))
@@ -385,7 +473,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             return _verify_response(
                 body,
                 reward=0.0,
-                reference_execution_error=ref_err[:2000],
+                reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS],
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),
             )
@@ -397,7 +485,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             return _verify_response(
                 body,
                 reward=0.0,
-                predicted_execution_error=pred_err[:2000],
+                predicted_execution_error=pred_err[:_REFERENCE_EXEC_ERR_MAX_CHARS],
                 reference_merged_output=sig_ref,
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),

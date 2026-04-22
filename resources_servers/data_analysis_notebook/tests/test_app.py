@@ -25,6 +25,7 @@ from app import (
     DataAnalysisNotebookResourcesServerConfig,
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
+    _previous_output_excerpt,
     extract_predicted_code_cells,
     extract_reference_code_sources,
     merged_output_signature,
@@ -136,6 +137,22 @@ class TestMergedSignature:
         nb.cells = [c]
         sig = merged_output_signature(nb, "exact")
         assert sig["text_merged"] == "printed\nrepr_value"
+
+    def test_previous_output_excerpt_trailing_lines(self) -> None:
+        nb = nbformat.v4.new_notebook()
+        c0 = nbformat.v4.new_code_cell("x")
+        c0.outputs = [new_output("stream", name="stdout", text="line0\n" * 20)]
+        c1 = nbformat.v4.new_code_cell("y")
+        c1.outputs = [new_output("stream", name="stdout", text="last\n")]
+        nb.cells = [c0, c1]
+        out = _previous_output_excerpt(nb, failing_code_cell_index=1, max_lines=3)
+        assert "line0" in out
+        assert out.count("\n") <= 4  # at most 3 data lines + leading "..." line
+
+    def test_previous_output_excerpt_no_prior_cells(self) -> None:
+        nb = nbformat.v4.new_notebook()
+        nb.cells = [nbformat.v4.new_code_cell("x")]
+        assert "no output" in _previous_output_excerpt(nb, 0, 5).lower()
 
 
 @pytest.fixture(scope="module")

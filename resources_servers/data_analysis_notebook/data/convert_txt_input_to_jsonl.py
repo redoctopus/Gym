@@ -14,7 +14,8 @@
 # Input (.txt, UTF-8): repeated *blocks*. Each block = one problem line, then a JSON array of
 # notebook-like cells (``cell_type`` ``code``|``markdown``, ``source`` string or list), then optional
 # ``data_paths:`` line until a blank line. In problem and cell text, ``/kaggle/input/<rest>`` is
-# replaced with ``<rest>``. Optional ``data_paths`` is a JSON array of paths relative to ``script_dir``
+# replaced with ``<rest>``. Exception: if the path is just ``/kaggle/input/``, it is replaced with ``input/``.
+# Optional ``data_paths`` is a JSON array of paths relative to ``script_dir``
 # (files or directories on disk); each must exist before conversion succeeds.
 #
 # Output (.jsonl): one JSON object per line — ``id``, ``responses_create_params`` (system + user),
@@ -40,7 +41,7 @@ _SYSTEM_PROMPT = (
 
 def _remap_kaggle_input_paths(text: str) -> str:
     """Replace ``/kaggle/input/<path>`` with ``<path>`` everywhere in ``text``."""
-    return text.replace('/kaggle/input/', "").replace('/kaggle/input', ".")
+    return text.replace('/kaggle/input/', "").replace('/kaggle/input', "input")
 
 
 def _parse_optional_line(line: str) -> tuple[str, Any]:
@@ -132,6 +133,8 @@ def _staging_path_from_input_rel(input_rel: str) -> str:
     """
     n = _normalize_input_rel(input_rel)
     kaggle_lead = "kaggle/input/"
+    if n == kaggle_lead:
+        return "input/"
     if n.startswith(kaggle_lead):
         n = n[len(kaggle_lead) :]
     if not n or n == ".":
