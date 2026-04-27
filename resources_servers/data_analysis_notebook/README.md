@@ -16,6 +16,8 @@ Each line includes:
 - `verifier_metadata` — **required** for verification:
   - `reference_notebook` (object): full nbformat v4 notebook JSON. Only code cells are run.
   - `data_paths` (optional): list of `{"source": "/path/on/server/or/relative", "path": "relative/path/in/sandbox"}` entries; each `source` file or directory is copied into the sandbox at `path` before execution (same layout for reference and predicted runs). Paths are resolved on the machine running the resources server.
+  - `execution_log_directory` (optional, server path): if set, overrides the resources server config field of the same name. When a log directory is active (config and/or this field), each `/verify` writes two append-only files, `{execution_log_stem}_reference.log` and `{execution_log_stem}_predicted.log` (or a random `stem` if `execution_log_stem` is omitted). The top of each file includes a **Task question** line: the first line of the last `user` message in `responses_create_params.input` (or the first line of `input` if it is a string), truncated to a max character count. After each code cell, the log records that cell’s source and **only that cell’s** structured output (not a cumulative merge across prior cells), then flushes—so a wall-clock kill can still show completed cells without repeated earlier output. Treat paths like `data_paths`: the dataset/operator is trusted. Very large cell output can produce large log files; source and JSON are truncated in the log beyond fixed limits.
+  - `execution_log_stem` (optional): non-empty string used as the basename for the two log files; must be a single path component (no `/` or `\\`). If missing and logging is enabled, a unique id is used per request.
 
 Top-level fields are forwarded to `/verify` by `simple_agent` (`extra="allow"`).
 
@@ -35,7 +37,7 @@ Thinking wrappers (`</think>`, `<thinking>...</thinking>`) are removed before pa
 
 ## Configuration
 
-See `[configs/data_analysis_notebook.yaml](configs/data_analysis_notebook.yaml)`: `max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`, `image_compare_mode` (`exact` | `none`).
+See `[configs/data_analysis_notebook.yaml](configs/data_analysis_notebook.yaml)`: `max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`, `image_compare_mode` (`exact` | `none`), and optional `execution_log_directory` (set to a writable path on the server to enable per-request logs unless overridden in `verifier_metadata`).
 
 ## Dependencies
 

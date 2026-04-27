@@ -25,7 +25,9 @@ from app import (
     DataAnalysisNotebookResourcesServerConfig,
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
+    _first_line_excerpt_for_log,
     _previous_output_excerpt,
+    _task_question_excerpt_for_log,
     extract_predicted_code_cells,
     extract_reference_code_sources,
     merged_output_signature,
@@ -35,7 +37,7 @@ from fastapi.testclient import TestClient
 from nbformat.v4 import new_output
 from pydantic import ValidationError
 
-from nemo_gym.openai_utils import NeMoGymResponse
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import ServerClient
 
 
@@ -67,6 +69,30 @@ def _assistant_response(text: str) -> NeMoGymResponse:
         tool_choice="auto",
         tools=[],
     )
+
+
+class TestTaskQuestionExcerpt:
+    def test_uses_last_user_message(self) -> None:
+        p = NeMoGymResponseCreateParamsNonStreaming(
+            input=[
+                {"type": "message", "role": "user", "content": "early line"},
+                {"type": "message", "role": "user", "content": "what is 2+2?"},
+            ],
+            parallel_tool_calls=False,
+        )
+        assert _task_question_excerpt_for_log(p) == "what is 2+2?"
+
+    def test_str_input_first_line_only(self) -> None:
+        p = NeMoGymResponseCreateParamsNonStreaming(
+            input="line a\nline b",
+            parallel_tool_calls=False,
+        )
+        assert _task_question_excerpt_for_log(p) == "line a"
+
+    def test_first_line_truncation(self) -> None:
+        long = "x" * 600
+        assert _first_line_excerpt_for_log(long).endswith("...")
+        assert len(_first_line_excerpt_for_log(long)) == 500
 
 
 class TestExtract:
@@ -264,6 +290,50 @@ class TestVerifyIntegration:
         r = dan_verify_client.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
+
+    async def test_verify_writes_per_execution_log_files(self, tmp_path: Path) -> None:
+        log_dir = tmp_path / "execution_logs"
+        log_dir.mkdir()
+        server = DataAnalysisNotebookResourcesServer(
+            config=DataAnalysisNotebookResourcesServerConfig(
+                host="0.0.0.0",
+                port=8080,
+                entrypoint="",
+                name="",
+                max_concurrent_executions=1,
+                execute_timeout_secs=90,
+                wall_clock_margin_secs=60,
+                execution_log_directory=str(log_dir),
+            ),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        app = server.setup_webserver()
+        with TestClient(app) as client:
+            body = DataAnalysisNotebookVerifyRequest(
+                responses_create_params={
+                    "input": [{"role": "user", "content": "Print hello."}],
+                    "parallel_tool_calls": False,
+                },
+                response=_assistant_response('```python\nprint("smoke_log_marker")\n```'),
+                verifier_metadata={
+                    "reference_notebook": _ref_nb('print("smoke_log_marker")'),
+                    "execution_log_stem": "task_smoke",
+                },
+            )
+            r = client.post("/verify", json=body.model_dump())
+            res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert r.status_code == 200
+        assert res.reward == 1.0
+        ref_log = log_dir / "task_smoke_reference.log"
+        pred_log = log_dir / "task_smoke_predicted.log"
+        assert ref_log.is_file() and pred_log.is_file()
+        out_ref = ref_log.read_text(encoding="utf-8")
+        out_pred = pred_log.read_text(encoding="utf-8")
+        assert "smoke_log_marker" in out_ref and "smoke_log_marker" in out_pred
+        assert "Output (this cell only" in out_ref
+        assert "# Task question" in out_ref
+        assert "Print hello" in out_ref
+        assert "# Task question" in out_pred
 
 
 def test_verify_request_requires_response() -> None:

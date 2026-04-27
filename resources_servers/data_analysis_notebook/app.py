@@ -21,10 +21,11 @@ import multiprocessing
 import queue
 import re
 import shutil
+import uuid
 from asyncio import Semaphore, get_running_loop
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, TextIO
 
 import nbformat
 from jupyter_client.utils import ensure_async
@@ -40,7 +41,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
-from nemo_gym.openai_utils import NeMoGymResponse
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 
 
 _THINKING_SPLIT_RE = re.compile(r"</think>", re.DOTALL)
@@ -53,6 +54,9 @@ class DataAnalysisNotebookResourcesServerConfig(BaseResourcesServerConfig):
     execute_timeout_secs: int = 120
     wall_clock_margin_secs: int = 90
     image_compare_mode: Literal["exact", "none"] = "exact"
+    # When set, each successful /verify with logging metadata writes {stem}_reference.log and
+    # {stem}_predicted.log under this directory (server machine). VerifierMetadata may override.
+    execution_log_directory: Optional[str] = None
 
 
 class VerifierMetadata(BaseModel):
@@ -60,6 +64,10 @@ class VerifierMetadata(BaseModel):
 
     reference_notebook: dict[str, Any]
     data_paths: Optional[list[dict[str, str]]] = None
+    # Server-side path; if set, overrides `execution_log_directory` from resources server config.
+    execution_log_directory: Optional[str] = None
+    # Basename for `{stem}_reference.log` and `{stem}_predicted.log`; if unset, a unique id is used.
+    execution_log_stem: Optional[str] = None
 
 
 class DataAnalysisNotebookVerifyRequest(BaseVerifyRequest):
@@ -106,6 +114,53 @@ def _verify_response(
         num_reference_code_cells=num_reference_code_cells,
         num_predicted_code_cells=num_predicted_code_cells,
     )
+
+
+# Task log header: first line of the user message only, at most this many characters.
+_MAX_TASK_QUESTION_LOG_EXCERPT_CHARS = 500
+
+
+def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for p in content:
+        t = p.get("text", "") if isinstance(p, dict) else getattr(p, "text", None)
+        if isinstance(t, str) and t:
+            parts.append(t)
+    return "\n".join(parts)
+
+
+def _first_line_excerpt_for_log(s: str) -> str:
+    """First line of ``s`` only, strip each line, then cap length (no second line)."""
+    s = s.strip()
+    if not s:
+        return ""
+    first = s.splitlines()[0].strip()
+    if len(first) <= _MAX_TASK_QUESTION_LOG_EXCERPT_CHARS:
+        return first
+    return first[: _MAX_TASK_QUESTION_LOG_EXCERPT_CHARS - 3] + "..."
+
+
+def _task_question_excerpt_for_log(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
+    """First line of the (last) user `input` for execution log file headers (length-capped)."""
+    inp = params.input
+    if isinstance(inp, str):
+        return _first_line_excerpt_for_log(inp)
+    for m in reversed(inp):
+        if getattr(m, "type", None) != "message":
+            continue
+        if getattr(m, "role", None) != "user":
+            continue
+        raw = _message_content_to_text(getattr(m, "content", None))
+        ex = _first_line_excerpt_for_log(raw)
+        if ex:
+            return ex
+    return ""
 
 
 def _strip_thinking(text: str) -> str:
@@ -261,6 +316,46 @@ def merged_signatures_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
 # Lines of prior stdout/plain/stderr to include when a code cell times out.
 _PREVIOUS_OUTPUT_PREVIEW_LINES = 5
 _REFERENCE_EXEC_ERR_MAX_CHARS = 5000
+_MAX_CELL_SOURCE_LOG_CHARS = 8_000
+_MAX_LOG_BLOCK_CHARS = 120_000
+
+
+def _write_execution_log_session_header(log_fh: TextIO, log_task_excerpt: Optional[str], cwd: Path) -> None:
+    if log_task_excerpt:
+        log_fh.write("# Task question\n")
+        log_fh.write(log_task_excerpt.strip() + "\n\n")
+    log_fh.write(f"Execution log (cwd={cwd})\n")
+    log_fh.flush()
+
+
+def _append_completed_cell_to_execution_log(log_fh: TextIO, code_cell_index: int, nb: NotebookNode) -> None:
+    """Append this code cell’s source and output only to the log (one shot per cell, flushed)."""
+    if code_cell_index < 0 or code_cell_index >= len(nb.cells):
+        return
+    cell = nb.cells[code_cell_index]
+    src = cell.get("source", "")
+    if isinstance(src, list):
+        src = "".join(src)
+    src = str(src)
+    if len(src) > _MAX_CELL_SOURCE_LOG_CHARS:
+        src = src[:_MAX_CELL_SOURCE_LOG_CHARS] + "\n... [truncated] ...\n"
+    one_cell_nb = nbformat.v4.new_notebook()
+    one_cell_nb.metadata = {}
+    one_cell_nb.cells = [cell]
+    sig = merged_output_signature(one_cell_nb, "none")
+    try:
+        sig_json = json.dumps(sig, indent=2, default=str)
+    except (TypeError, ValueError) as e:  # pragma: no cover - defensive
+        sig_json = f"<could not json-encode signature: {e!s}>"
+    if len(sig_json) > _MAX_LOG_BLOCK_CHARS:
+        sig_json = sig_json[:_MAX_LOG_BLOCK_CHARS] + "\n... [truncated] ...\n"
+    log_fh.write(f"---\n# Code cell {code_cell_index} (0-based) completed\n")
+    log_fh.write("## Source\n")
+    log_fh.write(src)
+    log_fh.write("\n## Output (this cell only, PNG omitted from JSON)\n")
+    log_fh.write(sig_json)
+    log_fh.write("\n")
+    log_fh.flush()
 
 
 def _previous_output_excerpt(nb: NotebookNode, failing_code_cell_index: int, max_lines: int) -> str:
@@ -306,57 +401,88 @@ async def _async_execute_code_cells(
     cwd: Path,
     sources: list[str],
     timeout: int,
+    log_path: Optional[Path] = None,
+    log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
     import os
 
-    os.environ["MPLBACKEND"] = "Agg"
-    os.chdir(cwd)
-    nb = nbformat.v4.new_notebook()
-    for src in sources:
-        nb.cells.append(nbformat.v4.new_code_cell(source=src))
-    client = NotebookClient(
-        nb,
-        timeout=timeout,
-        kernel_name="python3",
-        resources={"metadata": {"path": str(cwd)}},
-    )
-    client.reset_execution_trackers()
-    async with client.async_setup_kernel():
-        assert client.kc is not None
-        client.log.info("Executing notebook with kernel: %s" % client.kernel_name)
-        msg_id = await ensure_async(client.kc.kernel_info())
-        info_msg = await client.async_wait_for_reply(msg_id)
-        if info_msg is not None:
-            if "language_info" in info_msg["content"]:
-                client.nb.metadata["language_info"] = info_msg["content"]["language_info"]
-            else:
-                raise RuntimeError(
-                    'Kernel info received message content has no "language_info" key. '
-                    "Content is:\n" + str(info_msg["content"])
-                )
-        for index, cell in enumerate(client.nb.cells):
-            try:
-                await client.async_execute_cell(cell, index, execution_count=client.code_cells_executed + 1)
-            except CellTimeoutError as e:
-                return None, _format_cell_timeout_error(index, client.nb, e)
-        client.set_widgets_metadata()
-    return client.nb, None
+    log_fh: Optional[TextIO] = None
+    if log_path is not None:
+        log_fh = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    try:
+        os.environ["MPLBACKEND"] = "Agg"
+        os.chdir(cwd)
+        nb = nbformat.v4.new_notebook()
+        for src in sources:
+            nb.cells.append(nbformat.v4.new_code_cell(source=src))
+        client = NotebookClient(
+            nb,
+            timeout=timeout,
+            kernel_name="python3",
+            resources={"metadata": {"path": str(cwd)}},
+        )
+        client.reset_execution_trackers()
+        async with client.async_setup_kernel():
+            assert client.kc is not None
+            if log_fh is not None:
+                _write_execution_log_session_header(log_fh, log_task_excerpt, cwd)
+            client.log.info("Executing notebook with kernel: %s" % client.kernel_name)
+            msg_id = await ensure_async(client.kc.kernel_info())
+            info_msg = await client.async_wait_for_reply(msg_id)
+            if info_msg is not None:
+                if "language_info" in info_msg["content"]:
+                    client.nb.metadata["language_info"] = info_msg["content"]["language_info"]
+                else:
+                    raise RuntimeError(
+                        'Kernel info received message content has no "language_info" key. '
+                        "Content is:\n" + str(info_msg["content"])
+                    )
+            for index, cell in enumerate(client.nb.cells):
+                try:
+                    await client.async_execute_cell(cell, index, execution_count=client.code_cells_executed + 1)
+                except CellTimeoutError as e:
+                    if log_fh is not None:
+                        log_fh.write(f"---\n# Code cell {index} (0-based) CellTimeoutError\n")
+                        log_fh.write(_format_cell_timeout_error(index, client.nb, e))
+                        log_fh.write("\n")
+                        log_fh.flush()
+                    return None, _format_cell_timeout_error(index, client.nb, e)
+                if log_fh is not None:
+                    _append_completed_cell_to_execution_log(log_fh, index, client.nb)
+            client.set_widgets_metadata()
+        return client.nb, None
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
 
 @run_sync
 async def _execute_notebook_with_timeout_error_detail(
-    cwd: Path, sources: list[str], timeout: int
+    cwd: Path,
+    sources: list[str],
+    timeout: int,
+    log_path: Optional[Path] = None,
+    log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
     """Run cells like nbclient.execute(), but return structured timeout errors (see async impl)."""
-    return await _async_execute_code_cells(cwd, sources, timeout)
+    return await _async_execute_code_cells(cwd, sources, timeout, log_path=log_path, log_task_excerpt=log_task_excerpt)
 
 
-def _notebook_worker(cwd_str: str, sources: list[str], timeout: int, result_queue: multiprocessing.Queue) -> None:
-    from pathlib import Path
-
+def _notebook_worker(
+    cwd_str: str,
+    sources: list[str],
+    timeout: int,
+    result_queue: multiprocessing.Queue,
+    log_path_str: Optional[str],
+    log_task_excerpt: Optional[str],
+) -> None:
     try:
         cwd = Path(cwd_str)
-        nb, err = _execute_notebook_with_timeout_error_detail(cwd, sources, timeout)
+        log_p = Path(log_path_str) if log_path_str else None
+        nb, err = _execute_notebook_with_timeout_error_detail(
+            cwd, sources, timeout, log_path=log_p, log_task_excerpt=log_task_excerpt
+        )
         if err is not None:
             result_queue.put(("err", err))
             return
@@ -371,11 +497,17 @@ def execute_notebook_cells_process(
     sources: list[str],
     timeout: int,
     wall_margin: int,
+    log_path: Optional[Path] = None,
+    log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
     """Run code cells in an isolated process so cwd and kernels do not clash across async requests."""
     ctx = multiprocessing.get_context("spawn")
     q: multiprocessing.Queue = ctx.Queue(maxsize=1)
-    proc = ctx.Process(target=_notebook_worker, args=(str(cwd), sources, timeout, q))
+    lps: Optional[str] = str(log_path) if log_path is not None else None
+    proc = ctx.Process(
+        target=_notebook_worker,
+        args=(str(cwd), sources, timeout, q, lps, log_task_excerpt),
+    )
     proc.start()
     limit = timeout * max(len(sources), 1) + wall_margin
     proc.join(timeout=limit)
@@ -402,6 +534,8 @@ def _run_staging_and_execute(
     data_paths: Optional[list[dict[str, str]]],
     timeout: int,
     wall_margin: int,
+    log_path: Optional[Path] = None,
+    log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
     import tempfile
 
@@ -410,7 +544,30 @@ def _run_staging_and_execute(
         err = _stage_data_paths(cwd, data_paths)
         if err:
             return None, err
-        return execute_notebook_cells_process(cwd, sources, timeout, wall_margin)
+        return execute_notebook_cells_process(
+            cwd, sources, timeout, wall_margin, log_path=log_path, log_task_excerpt=log_task_excerpt
+        )
+
+
+def _execution_log_basename(execution_log_stem: Optional[str]) -> str:
+    """Return a single path segment for `{stem}_reference.log` / `{stem}_predicted.log`."""
+    raw = (execution_log_stem or "").strip()
+    if not raw or "/" in raw or "\\" in raw or ".." in raw or raw in (".", ".."):
+        return uuid.uuid4().hex
+    return raw
+
+
+def _prepare_execution_log_paths(
+    log_dir: Optional[str],
+    execution_log_stem: Optional[str],
+) -> tuple[Optional[Path], Optional[Path]]:
+    """If ``log_dir`` is set, ensure it exists and return (reference, predicted) log file paths."""
+    if not (log_dir or "").strip():
+        return None, None
+    base = Path(log_dir).expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    stem = _execution_log_basename(execution_log_stem)
+    return base / f"{stem}_reference.log", base / f"{stem}_predicted.log"
 
 
 class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
@@ -459,15 +616,25 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         margin = self.config.wall_clock_margin_secs
         image_mode = self.config.image_compare_mode
 
-        run_staged = partial(
-            _run_staging_and_execute,
-            data_paths=meta.data_paths,
-            timeout=timeout,
-            wall_margin=margin,
-        )
+        log_dir = meta.execution_log_directory or self.config.execution_log_directory
+        if (log_dir or "").strip() == "":
+            log_dir = None
+        ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, meta.execution_log_stem)
+        log_task = _task_question_excerpt_for_log(body.responses_create_params) if ref_log_path else None
+
+        def _execute_staged(sources: list[str], log_p: Optional[Path]) -> tuple[Optional[NotebookNode], Optional[str]]:
+            return _run_staging_and_execute(
+                sources,
+                meta.data_paths,
+                timeout,
+                margin,
+                log_path=log_p,
+                log_task_excerpt=log_task,
+            )
+
         async with self._semaphore:
-            ref_nb, ref_err = await loop.run_in_executor(None, partial(run_staged, ref_sources))
-            pred_nb, pred_err = await loop.run_in_executor(None, partial(run_staged, pred_sources))
+            ref_nb, ref_err = await loop.run_in_executor(None, partial(_execute_staged, ref_sources, ref_log_path))
+            pred_nb, pred_err = await loop.run_in_executor(None, partial(_execute_staged, pred_sources, pred_log_path))
 
         if ref_err:
             return _verify_response(

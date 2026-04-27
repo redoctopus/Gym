@@ -9,6 +9,8 @@ data_analysis_notebook:
       execute_timeout_secs: 120
       wall_clock_margin_secs: 90
       image_compare_mode: exact
+      # Server-side directory for optional per-evaluation execution logs; verifier_metadata may override.
+      # execution_log_directory: /tmp/dan_exec_logs
 data_analysis_notebook_simple_agent:
   responses_api_agents:
     simple_agent:
