@@ -15,8 +15,8 @@
 
 import tempfile
 from pathlib import Path
-from typing import Generator
-from unittest.mock import MagicMock
+from typing import Any, Generator
+from unittest.mock import AsyncMock, MagicMock
 
 import nbformat
 import pytest
@@ -31,14 +31,81 @@ from app import (
     extract_predicted_code_cells,
     extract_reference_code_sources,
     merged_output_signature,
-    merged_signatures_match,
+    parse_notebook_judge_verdict,
+    redact_signature_for_judge,
 )
 from fastapi.testclient import TestClient
 from nbformat.v4 import new_output
 from pydantic import ValidationError
 
-from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.config_types import ModelServerRef
+from nemo_gym.openai_utils import (
+    NeMoGymResponse,
+    NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseOutputMessage,
+    NeMoGymResponseOutputText,
+)
 from nemo_gym.server_utils import ServerClient
+
+
+_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompt_templates" / "notebook_task_judge.txt"
+
+
+def _default_dan_config(**kwargs: Any) -> DataAnalysisNotebookResourcesServerConfig:
+    base: dict[str, Any] = {
+        "host": "0.0.0.0",
+        "port": 8080,
+        "entrypoint": "",
+        "name": "",
+        "max_concurrent_executions": 1,
+        "execute_timeout_secs": 90,
+        "wall_clock_margin_secs": 60,
+        "judge_model_server": ModelServerRef(type="responses_api_models", name="judge"),
+        "judge_responses_create_params": NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        "judge_prompt_template_fpath": str(_PROMPT_PATH),
+        "judge_probe_on_startup": False,
+    }
+    base.update(kwargs)
+    return DataAnalysisNotebookResourcesServerConfig(**base)
+
+
+def _stub_server_client() -> MagicMock:
+    mock = MagicMock(spec=ServerClient)
+    mock.poll_for_status = MagicMock(return_value="success")
+    mock._build_server_base_url = MagicMock(return_value="http://127.0.0.1:9")
+    mock.global_config_dict = MagicMock()
+    return mock
+
+
+def _mock_judge_response(server_mock: MagicMock, judge_text: str) -> None:
+    judge_response = NeMoGymResponse(
+        id="judge_resp",
+        created_at=0.0,
+        model="judge",
+        object="response",
+        output=[
+            NeMoGymResponseOutputMessage(
+                id="msg_judge",
+                content=[NeMoGymResponseOutputText(annotations=[], text=judge_text, type="output_text")],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ],
+        parallel_tool_calls=False,
+        tool_choice="none",
+        tools=[],
+    )
+    post_mock = MagicMock()
+    post_mock.read = AsyncMock(return_value=judge_response.model_dump_json().encode())
+    server_mock.post = AsyncMock(return_value=post_mock)
+
+
+def _make_test_client(judge_output: str = "VERDICT: PASS\nREASON: ok") -> TestClient:
+    mock = _stub_server_client()
+    _mock_judge_response(mock, judge_output)
+    server = DataAnalysisNotebookResourcesServer(config=_default_dan_config(), server_client=mock)
+    return TestClient(server.setup_webserver())
 
 
 def _ref_nb(*sources: str) -> dict:
@@ -134,7 +201,7 @@ class TestMergedSignature:
 
         a = merged_output_signature(nb_split, "exact")
         b = merged_output_signature(nb_one, "exact")
-        assert merged_signatures_match(a, b)
+        assert a == b
 
     def test_stderr_separate_from_stdout(self) -> None:
         nb = nbformat.v4.new_notebook()
@@ -181,27 +248,46 @@ class TestMergedSignature:
         assert "no output" in _previous_output_excerpt(nb, 0, 5).lower()
 
 
-@pytest.fixture(scope="module")
-def dan_verify_client() -> Generator[TestClient, None, None]:
-    server = DataAnalysisNotebookResourcesServer(
-        config=DataAnalysisNotebookResourcesServerConfig(
-            host="0.0.0.0",
-            port=8080,
-            entrypoint="",
-            name="",
-            max_concurrent_executions=1,
-            execute_timeout_secs=90,
-            wall_clock_margin_secs=60,
-        ),
-        server_client=MagicMock(spec=ServerClient),
-    )
-    app = server.setup_webserver()
-    with TestClient(app) as client:
+@pytest.fixture
+def client_judge_pass() -> Generator[TestClient, None, None]:
+    with _make_test_client("VERDICT: PASS\nREASON: ok") as client:
         yield client
 
 
+@pytest.fixture
+def client_judge_fail() -> Generator[TestClient, None, None]:
+    with _make_test_client("VERDICT: FAIL\nREASON: outputs disagree") as client:
+        yield client
+
+
+class TestParseJudgeVerdict:
+    def test_pass(self) -> None:
+        ok, label, reason = parse_notebook_judge_verdict("Analysis.\nVERDICT: PASS\nREASON: looks good")
+        assert ok is True and label == "pass" and reason == "looks good"
+
+    def test_fail(self) -> None:
+        ok, label, reason = parse_notebook_judge_verdict("VERDICT: FAIL\nREASON: missing plot")
+        assert ok is False and label == "fail"
+
+    def test_ambiguous(self) -> None:
+        ok, label, _ = parse_notebook_judge_verdict("VERDICT: PASS\nVERDICT: FAIL")
+        assert ok is None and label == "judge_parsing_error"
+
+    def test_empty(self) -> None:
+        ok, label, _ = parse_notebook_judge_verdict("")
+        assert ok is None and label == "judge_parsing_error"
+
+
+class TestRedactSignatureForJudge:
+    def test_pngs_become_summary(self) -> None:
+        sig = {"text_merged": "a", "stderr_merged": "", "pngs": ["aaa", "bbb"], "errors": []}
+        out = redact_signature_for_judge(sig, 1000)
+        assert "2 PNG figure" in out["png_summary"]
+        assert "pngs" not in out
+
+
 class TestVerifyIntegration:
-    async def test_verify_pass_matching_code(self, dan_verify_client: TestClient) -> None:
+    async def test_verify_pass_matching_code(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={
                 "input": [{"role": "user", "content": "Print hello."}],
@@ -210,52 +296,67 @@ class TestVerifyIntegration:
             response=_assistant_response('```python\nprint("hello")\n```'),
             verifier_metadata={"reference_notebook": _ref_nb('print("hello")')},
         )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
+        r = client_judge_pass.post("/verify", json=body.model_dump())
         assert r.status_code == 200
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
         assert res.reference_merged_output is not None
         assert "hello" in res.reference_merged_output["text_merged"]
+        assert res.judge_evaluations is not None
+        assert res.judge_evaluations[0].verdict_label == "pass"
 
-    async def test_verify_fail_different_output(self, dan_verify_client: TestClient) -> None:
+    async def test_verify_semantic_pass_when_outputs_differ(self, client_judge_pass: TestClient) -> None:
+        """Judge PASS yields reward 1.0 even when merged stdout differs from reference."""
+        body = DataAnalysisNotebookVerifyRequest(
+            responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
+            response=_assistant_response('```python\nprint("candidate")\n```'),
+            verifier_metadata={"reference_notebook": _ref_nb('print("reference")')},
+        )
+        r = client_judge_pass.post("/verify", json=body.model_dump())
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 1.0
+        assert res.match is True
+        assert "reference" in res.reference_merged_output["text_merged"]
+
+    async def test_verify_fail_different_output(self, client_judge_fail: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
             response=_assistant_response('```python\nprint("wrong")\n```'),
             verifier_metadata={"reference_notebook": _ref_nb('print("right")')},
         )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
+        r = client_judge_fail.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.match is False
         assert res.reference_merged_output is not None
         assert "right" in res.reference_merged_output["text_merged"]
 
-    async def test_verify_fail_no_python_fence(self, dan_verify_client: TestClient) -> None:
+    async def test_verify_fail_no_python_fence(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
             response=_assistant_response("just prose, no code"),
             verifier_metadata={"reference_notebook": _ref_nb("print(1)")},
         )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
+        r = client_judge_pass.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
-        assert "no python code fences" in (res.comparison_detail or "")
+        assert "no python code fences" in res.comparison_detail
 
-    async def test_verify_predicted_syntax_error(self, dan_verify_client: TestClient) -> None:
+    async def test_verify_predicted_syntax_error(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
             response=_assistant_response("```python\n*** not valid\n```"),
             verifier_metadata={"reference_notebook": _ref_nb("print(1)")},
         )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
+        r = client_judge_pass.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.predicted_execution_error
         assert res.reference_merged_output is not None
         assert res.reference_merged_output["text_merged"] == "1"
 
-    async def test_verify_with_data_paths(self, dan_verify_client: TestClient) -> None:
+    async def test_verify_with_data_paths(self, client_judge_pass: TestClient) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
             f.write("k,v\n9,9\n")
             src_path = f.name
@@ -273,13 +374,13 @@ class TestVerifyIntegration:
                     "data_paths": [{"source": src_path, "path": "staged.csv"}],
                 },
             )
-            r = dan_verify_client.post("/verify", json=body.model_dump())
+            r = client_judge_pass.post("/verify", json=body.model_dump())
             res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
             assert res.reward == 1.0
         finally:
             Path(src_path).unlink(missing_ok=True)
 
-    async def test_strip_thinking_before_fences(self, dan_verify_client: TestClient) -> None:
+    async def test_strip_thinking_before_fences(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
             response=_assistant_response(
@@ -287,25 +388,18 @@ class TestVerifyIntegration:
             ),
             verifier_metadata={"reference_notebook": _ref_nb("print(7)")},
         )
-        r = dan_verify_client.post("/verify", json=body.model_dump())
+        r = client_judge_pass.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
 
     async def test_verify_writes_per_execution_log_files(self, tmp_path: Path) -> None:
         log_dir = tmp_path / "execution_logs"
         log_dir.mkdir()
+        mock = _stub_server_client()
+        _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
         server = DataAnalysisNotebookResourcesServer(
-            config=DataAnalysisNotebookResourcesServerConfig(
-                host="0.0.0.0",
-                port=8080,
-                entrypoint="",
-                name="",
-                max_concurrent_executions=1,
-                execute_timeout_secs=90,
-                wall_clock_margin_secs=60,
-                execution_log_directory=str(log_dir),
-            ),
-            server_client=MagicMock(spec=ServerClient),
+            config=_default_dan_config(execution_log_directory=str(log_dir)),
+            server_client=mock,
         )
         app = server.setup_webserver()
         with TestClient(app) as client:
@@ -334,6 +428,40 @@ class TestVerifyIntegration:
         assert "# Task question" in out_ref
         assert "Print hello" in out_ref
         assert "# Task question" in out_pred
+
+
+class TestJudgeFailure:
+    def test_judge_unreachable_returns_zero(self) -> None:
+        mock = _stub_server_client()
+        mock.post = AsyncMock(side_effect=ConnectionError("refused"))
+        server = DataAnalysisNotebookResourcesServer(config=_default_dan_config(), server_client=mock)
+        with TestClient(server.setup_webserver()) as client:
+            body = DataAnalysisNotebookVerifyRequest(
+                responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
+                response=_assistant_response("```python\nprint(1)\n```"),
+                verifier_metadata={"reference_notebook": _ref_nb("print(1)")},
+            )
+            r = client.post("/verify", json=body.model_dump())
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 0.0
+        assert res.judge_evaluations is not None
+        assert res.judge_evaluations[0].verdict_label == "judge_error"
+
+    def test_judge_garbage_output_returns_parsing_error(self) -> None:
+        mock = _stub_server_client()
+        _mock_judge_response(mock, "I cannot decide.")
+        server = DataAnalysisNotebookResourcesServer(config=_default_dan_config(), server_client=mock)
+        with TestClient(server.setup_webserver()) as client:
+            body = DataAnalysisNotebookVerifyRequest(
+                responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
+                response=_assistant_response("```python\nprint(1)\n```"),
+                verifier_metadata={"reference_notebook": _ref_nb("print(1)")},
+            )
+            r = client.post("/verify", json=body.model_dump())
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 0.0
+        assert res.judge_evaluations is not None
+        assert res.judge_evaluations[0].verdict_label == "judge_parsing_error"
 
 
 def test_verify_request_requires_response() -> None:

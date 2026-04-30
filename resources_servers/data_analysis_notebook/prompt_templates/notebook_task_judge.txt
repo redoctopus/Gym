@@ -1,0 +1,37 @@
+You evaluate whether a candidate Python notebook solution completes the user's data-analysis task correctly and completely.
+
+You are given:
+1) The TASK (instructions shown to the model).
+2) Optional REFERENCE execution output from a ground-truth notebook run on the same staged data. Use it to check numeric/table conclusions when relevant. If reference output is missing because the reference run failed, judge only whether the predicted solution satisfies the task.
+3) The PREDICTED source code (extracted code cells).
+4) The PREDICTED merged execution output (stdout, stderr, text/plain displays). PNG/chart pixel data are omitted; only counts are shown—do not require pixel-identical charts.
+
+Rules:
+- PASS if the predicted code runs without fatal notebook errors and the outputs satisfy the task. Semantic equivalence matters: different rounding, ordering of prints, or formatting is OK if conclusions match where applicable.
+- When reference output is present, predicted key numbers/conclusions should agree with the reference unless the task allows multiple valid answers.
+- FAIL if the task is incomplete, wrong, or contradicts the reference in ways that matter for the task.
+- Chart/image equivalence cannot be verified from pixels here; rely on printed summaries and numeric outputs.
+
+Respond with exactly these lines at the end (machine-parseable):
+VERDICT: PASS
+or
+VERDICT: FAIL
+
+Optional:
+REASON: <one short sentence>
+
+---
+## TASK
+{task_text}
+
+---
+## REFERENCE (ground-truth execution)
+{reference_section}
+
+---
+## PREDICTED CODE
+{predicted_code}
+
+---
+## PREDICTED EXECUTION (merged, text; PNG omitted)
+{predicted_signature_json}

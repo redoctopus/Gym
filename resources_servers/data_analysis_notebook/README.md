@@ -1,6 +1,10 @@
 # Data analysis notebook (resources server)
 
-Verifies single-turn model answers by running **reference** code cells (from a ground-truth notebook) and **predicted** cells (parsed from the model reply) in **separate** temporary working directories and fresh IPython kernels, then comparing **merged** outputs (stdout, stderr, `text/plain` displays, and optionally PNG).
+Verifies single-turn model answers by running **reference** code cells (from a ground-truth notebook) and **predicted** cells (parsed from the model reply) in **separate** temporary working directories and fresh IPython kernels. **Merged** execution outputs (stdout, stderr, `text/plain`, optional PNG counts) are sent to an **LLM judge** together with the task text and predicted code. The judge decides whether the prediction **correctly and completely** satisfies the task, using reference execution output as a guide when it is available (semantic match; not byte-identical output).
+
+If the reference notebook fails to execute, verification still runs for the predicted notebook only: the judge does not receive reference output (only the task and predicted code/output).
+
+**Charts / images:** PNG pixel data is **not** sent to the judge (only how many figures were produced). Pixel-level chart equivalence would require a separate vision-capable judge.
 
 Markdown cells in the reference notebook are ignored; only `cell_type == "code"` sources are executed, in order.
 
@@ -31,13 +35,29 @@ print("example")
 ```
 ```
 
-The number of fences **may** differ from the number of reference code cells; comparison uses **merged** stdout/stderr and display outputs across all executed cells.
+The number of fences **may** differ from the number of reference code cells; the judge sees **merged** stdout/stderr and display outputs across all executed cells (after redaction/truncation for the prompt).
 
 Thinking wrappers (`</think>`, `<thinking>...</thinking>`) are removed before parsing fences.
 
 ## Configuration
 
-See `[configs/data_analysis_notebook.yaml](configs/data_analysis_notebook.yaml)`: `max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`, `image_compare_mode` (`exact` | `none`), and optional `execution_log_directory` (set to a writable path on the server to enable per-request logs unless overridden in `verifier_metadata`).
+See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), `image_compare_mode` (`exact` | `none`) for building merged signatures (PNG lists), optional `execution_log_directory`, and **judge** settings:
+
+- `judge_model_server` — second `responses_api_models` instance (default YAML uses OpenAI-compatible `gpt-4o-mini` via `notebook_judge_model`).
+- `judge_responses_create_params` — typically low temperature; `max_output_tokens` large enough for `VERDICT:` + optional `REASON:`.
+- `judge_prompt_template_fpath` — rubric template under `prompt_templates/`.
+- `judge_max_output_chars` — per-field truncation for reference/predicted text sent to the judge.
+- `judge_probe_on_startup` — wait until the judge `/v1/responses` endpoint is reachable at startup (set `false` in tests).
+
+Composite runs must include **both** the resources server config and the judge model server config, for example:
+
+```bash
+ng_run "+config_paths=[resources_servers/data_analysis_notebook/configs/data_analysis_notebook.yaml,responses_api_models/openai_model/configs/openai_model.yaml]"
+```
+
+(`env.yaml` should define `policy_base_url`, `policy_api_key`, and optionally override model names.)
+
+The verify response may include `judge_evaluations` with the judge call and parsed `verdict_label` (`pass`, `fail`, `judge_error`, `judge_parsing_error`).
 
 ## Dependencies
 

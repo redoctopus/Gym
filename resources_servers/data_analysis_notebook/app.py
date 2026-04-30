@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import multiprocessing
 import queue
 import re
@@ -25,15 +27,17 @@ import uuid
 from asyncio import Semaphore, get_running_loop
 from functools import partial
 from pathlib import Path
+from time import sleep
 from typing import Any, Literal, Optional, TextIO
 
 import nbformat
+import requests
 from jupyter_client.utils import ensure_async
 from jupyter_core.utils import run_sync
 from nbclient import NotebookClient
 from nbclient.exceptions import CellTimeoutError
 from nbformat.notebooknode import NotebookNode
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -41,7 +45,17 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
-from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.config_types import ModelServerRef
+from nemo_gym.global_config import get_first_server_config_dict
+from nemo_gym.openai_utils import (
+    NeMoGymEasyInputMessage,
+    NeMoGymResponse,
+    NeMoGymResponseCreateParamsNonStreaming,
+)
+from nemo_gym.server_utils import get_response_json
+
+
+logger = logging.getLogger(__name__)
 
 
 _THINKING_SPLIT_RE = re.compile(r"</think>", re.DOTALL)
@@ -57,6 +71,12 @@ class DataAnalysisNotebookResourcesServerConfig(BaseResourcesServerConfig):
     # When set, each successful /verify with logging metadata writes {stem}_reference.log and
     # {stem}_predicted.log under this directory (server machine). VerifierMetadata may override.
     execution_log_directory: Optional[str] = None
+    judge_model_server: ModelServerRef
+    judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+    judge_endpoint_max_concurrency: int = 32
+    judge_prompt_template_fpath: str = "prompt_templates/notebook_task_judge.txt"
+    judge_max_output_chars: int = 12000
+    judge_probe_on_startup: bool = True
 
 
 class VerifierMetadata(BaseModel):
@@ -74,11 +94,24 @@ class DataAnalysisNotebookVerifyRequest(BaseVerifyRequest):
     verifier_metadata: dict[str, Any]
 
 
+class NotebookJudgeEvaluation(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+    response: Optional[NeMoGymResponse] = None
+    verdict_label: Optional[str] = None
+    reason: Optional[str] = None
+
+
 class DataAnalysisNotebookVerifyResponse(BaseVerifyResponse):
     match: bool = False
     reference_execution_error: Optional[str] = None
     predicted_execution_error: Optional[str] = None
-    comparison_detail: Optional[str] = None
+    comparison_detail: str = Field(
+        ...,
+        min_length=1,
+        description="Human-readable summary of verification outcome; always set (never null).",
+    )
     reference_merged_output: Optional[dict[str, Any]] = Field(
         default=None,
         description=(
@@ -89,19 +122,21 @@ class DataAnalysisNotebookVerifyResponse(BaseVerifyResponse):
     )
     num_reference_code_cells: int = 0
     num_predicted_code_cells: int = 0
+    judge_evaluations: Optional[list[NotebookJudgeEvaluation]] = None
 
 
 def _verify_response(
     body: DataAnalysisNotebookVerifyRequest,
     *,
     reward: float,
+    comparison_detail: str,
     match: bool = False,
-    comparison_detail: Optional[str] = None,
     reference_execution_error: Optional[str] = None,
     predicted_execution_error: Optional[str] = None,
     reference_merged_output: Optional[dict[str, Any]] = None,
     num_reference_code_cells: int = 0,
     num_predicted_code_cells: int = 0,
+    judge_evaluations: Optional[list[NotebookJudgeEvaluation]] = None,
 ) -> DataAnalysisNotebookVerifyResponse:
     return DataAnalysisNotebookVerifyResponse(
         **body.model_dump(),
@@ -113,6 +148,7 @@ def _verify_response(
         reference_merged_output=reference_merged_output,
         num_reference_code_cells=num_reference_code_cells,
         num_predicted_code_cells=num_predicted_code_cells,
+        judge_evaluations=judge_evaluations,
     )
 
 
@@ -136,7 +172,7 @@ def _message_content_to_text(content: Any) -> str:
 
 
 def _first_line_excerpt_for_log(s: str) -> str:
-    """First line of ``s`` only, strip each line, then cap length (no second line)."""
+    """First line of ``s`` only, strip each line, then cap length."""
     s = s.strip()
     if not s:
         return ""
@@ -309,8 +345,119 @@ def merged_output_signature(nb: NotebookNode, image_mode: Literal["exact", "none
     }
 
 
-def merged_signatures_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return a == b
+_JUDGE_VERDICT_PASS_RE = re.compile(r"^\s*VERDICT:\s*PASS\s*$", re.MULTILINE | re.IGNORECASE)
+_JUDGE_VERDICT_FAIL_RE = re.compile(r"^\s*VERDICT:\s*FAIL\s*$", re.MULTILINE | re.IGNORECASE)
+_JUDGE_REASON_RE = re.compile(r"^\s*REASON:\s*(.+?)(?:\n|$)", re.MULTILINE | re.DOTALL | re.IGNORECASE)
+
+
+def _truncate_for_judge(s: str, max_chars: int) -> str:
+    s = s or ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 20] + "\n...[truncated]...\n"
+
+
+def redact_signature_for_judge(sig: dict[str, Any], max_chars_per_field: int) -> dict[str, Any]:
+    """Drop PNG payloads; truncate text fields for the judge prompt."""
+    pngs = sig.get("pngs") or []
+    png_note = f"{len(pngs)} PNG figure(s); pixel data omitted."
+    errors = sig.get("errors") or []
+    err_out: list[dict[str, Any]] = []
+    for e in errors[:50]:
+        tb = e.get("traceback") or []
+        if isinstance(tb, list) and len(tb) > 30:
+            tb = tb[-30:]
+        err_out.append(
+            {
+                "ename": e.get("ename", ""),
+                "evalue": _truncate_for_judge(str(e.get("evalue", "")), max_chars_per_field),
+                "traceback": tb,
+            }
+        )
+    return {
+        "text_merged": _truncate_for_judge(str(sig.get("text_merged") or ""), max_chars_per_field),
+        "stderr_merged": _truncate_for_judge(str(sig.get("stderr_merged") or ""), max_chars_per_field),
+        "png_summary": png_note,
+        "errors": err_out,
+    }
+
+
+def parse_notebook_judge_verdict(text: str) -> tuple[Optional[bool], Optional[str], Optional[str]]:
+    """Parse VERDICT line and optional REASON. Returns (passed, verdict_label, reason)."""
+    has_pass = bool(_JUDGE_VERDICT_PASS_RE.search(text))
+    has_fail = bool(_JUDGE_VERDICT_FAIL_RE.search(text))
+    reason_m = _JUDGE_REASON_RE.search(text)
+    reason = reason_m.group(1).strip() if reason_m else None
+    if has_pass == has_fail:
+        return None, "judge_parsing_error", reason
+    if has_pass:
+        return True, "pass", reason
+    return False, "fail", reason
+
+
+def _inputs_to_task_text(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
+    """Serialize conversation input into one string for the judge."""
+    inp = params.input
+    if isinstance(inp, str):
+        return inp.strip()
+    lines: list[str] = []
+    for m in inp:
+        if getattr(m, "type", None) != "message":
+            continue
+        role = getattr(m, "role", None)
+        raw = _message_content_to_text(getattr(m, "content", None))
+        if raw:
+            lines.append(f"{role}:\n{raw}")
+    return "\n\n".join(lines).strip() or "(empty task)"
+
+
+def _resolve_judge_prompt_path(config_path: str) -> Path:
+    p = Path(config_path)
+    if p.is_absolute():
+        return p
+    return Path(__file__).resolve().parent / p
+
+
+def _last_assistant_output_text(resp: NeMoGymResponse) -> Optional[str]:
+    try:
+        last_output = resp.output[-1]
+        if getattr(last_output, "type", None) != "message":
+            return None
+        last_content = last_output.content[-1]
+        return getattr(last_content, "text", "") or ""
+    except Exception:
+        return None
+
+
+def _fill_notebook_judge_prompt(
+    template: str,
+    *,
+    task_text: str,
+    reference_section: str,
+    predicted_code: str,
+    predicted_signature_json: str,
+) -> str:
+    return (
+        template.replace("{task_text}", task_text)
+        .replace("{reference_section}", reference_section)
+        .replace("{predicted_code}", predicted_code)
+        .replace("{predicted_signature_json}", predicted_signature_json)
+    )
+
+
+def _comparison_detail_for_judge(ok: Optional[bool], evaluation: NotebookJudgeEvaluation) -> str:
+    parts: list[str] = []
+    if evaluation.reason:
+        parts.append(evaluation.reason)
+    if evaluation.verdict_label and evaluation.verdict_label != "pass":
+        parts.append(f"verdict_label={evaluation.verdict_label}")
+    if parts:
+        return "; ".join(parts)
+    if ok is True:
+        return "pass"
+    if ok is None:
+        return f"judge_did_not_resolve verdict_label={evaluation.verdict_label or 'unknown'}"
+    return f"fail verdict_label={evaluation.verdict_label or 'unknown'}"
 
 
 # Lines of prior stdout/plain/stderr to include when a code cell times out.
@@ -574,7 +721,93 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
     config: DataAnalysisNotebookResourcesServerConfig
 
     def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
         self._semaphore: Semaphore = Semaphore(value=self.config.max_concurrent_executions)
+        self._judge_semaphore = asyncio.Semaphore(value=self.config.judge_endpoint_max_concurrency)
+        tpl_path = _resolve_judge_prompt_path(self.config.judge_prompt_template_fpath)
+        with open(tpl_path, encoding="utf-8") as f:
+            self._judge_prompt_template = f.read().strip()
+
+    def setup_webserver(self):
+        if self.config.judge_probe_on_startup:
+            self._ensure_judge_backend_ready()
+        return super().setup_webserver()
+
+    def _ensure_judge_backend_ready(self) -> None:
+        judge_name = self.config.judge_model_server.name
+        logger.info("Waiting for judge model server '%s' to become reachable...", judge_name)
+        while self.server_client.poll_for_status(judge_name) != "success":
+            sleep(10)
+
+        judge_config = get_first_server_config_dict(self.server_client.global_config_dict, judge_name)
+        judge_url = self.server_client._build_server_base_url(judge_config)
+        logger.info("Verifying judge backend through '%s' at %s ...", judge_name, judge_url)
+        while True:
+            try:
+                requests.post(f"{judge_url}/v1/responses", json={"input": []}, timeout=10)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                logger.warning("Judge backend not yet reachable through '%s', retrying in 10s...", judge_name)
+                sleep(10)
+        logger.info("Judge model server '%s' is reachable.", judge_name)
+
+    async def _run_llm_judge(
+        self,
+        *,
+        task_text: str,
+        reference_section: str,
+        predicted_code: str,
+        predicted_signature: dict[str, Any],
+    ) -> tuple[Optional[bool], NotebookJudgeEvaluation]:
+        cfg = self.config
+        max_c = cfg.judge_max_output_chars
+        pred_redacted = redact_signature_for_judge(predicted_signature, max_c)
+        pred_json = json.dumps(pred_redacted, indent=2, default=str)
+        pred_code_trunc = _truncate_for_judge(predicted_code, max_c * 2)
+
+        user_prompt = _fill_notebook_judge_prompt(
+            self._judge_prompt_template,
+            task_text=task_text,
+            reference_section=reference_section,
+            predicted_code=pred_code_trunc,
+            predicted_signature_json=pred_json,
+        )
+
+        responses_create_params = cfg.judge_responses_create_params.model_copy(deep=True)
+        responses_create_params.input = [
+            NeMoGymEasyInputMessage(role="user", content=user_prompt),
+        ]
+
+        async with self._judge_semaphore:
+            try:
+                http_response = await self.server_client.post(
+                    server_name=cfg.judge_model_server.name,
+                    url_path="/v1/responses",
+                    json=responses_create_params,
+                )
+                judge_response = NeMoGymResponse.model_validate(await get_response_json(http_response))
+            except Exception as e:
+                logger.error("Judge HTTP POST error: %s %s", type(e).__name__, e)
+                return None, NotebookJudgeEvaluation(
+                    responses_create_params=responses_create_params,
+                    verdict_label="judge_error",
+                )
+
+        evaluation = NotebookJudgeEvaluation(
+            responses_create_params=responses_create_params,
+            response=judge_response,
+        )
+        text = _last_assistant_output_text(judge_response)
+        if text is None:
+            evaluation.verdict_label = "judge_parsing_error"
+            return None, evaluation
+
+        passed, vlabel, reason = parse_notebook_judge_verdict(text)
+        evaluation.verdict_label = vlabel
+        evaluation.reason = reason
+        if passed is None:
+            return None, evaluation
+        return passed, evaluation
 
     async def verify(self, body: DataAnalysisNotebookVerifyRequest) -> DataAnalysisNotebookVerifyResponse:
         if not body.verifier_metadata:
@@ -615,6 +848,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         timeout = self.config.execute_timeout_secs
         margin = self.config.wall_clock_margin_secs
         image_mode = self.config.image_compare_mode
+        max_c = self.config.judge_max_output_chars
 
         log_dir = meta.execution_log_directory or self.config.execution_log_directory
         if (log_dir or "").strip() == "":
@@ -636,43 +870,66 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             ref_nb, ref_err = await loop.run_in_executor(None, partial(_execute_staged, ref_sources, ref_log_path))
             pred_nb, pred_err = await loop.run_in_executor(None, partial(_execute_staged, pred_sources, pred_log_path))
 
-        if ref_err:
-            return _verify_response(
-                body,
-                reward=0.0,
-                reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS],
-                num_reference_code_cells=len(ref_sources),
-                num_predicted_code_cells=len(pred_sources),
-            )
-
-        assert ref_nb is not None
-        sig_ref = merged_output_signature(ref_nb, image_mode)
+        sig_ref: Optional[dict[str, Any]] = None
+        if not ref_err:
+            assert ref_nb is not None
+            sig_ref = merged_output_signature(ref_nb, image_mode)
 
         if pred_err:
+            pred_exc = pred_err[:_REFERENCE_EXEC_ERR_MAX_CHARS]
             return _verify_response(
                 body,
                 reward=0.0,
-                predicted_execution_error=pred_err[:_REFERENCE_EXEC_ERR_MAX_CHARS],
+                comparison_detail=f"predicted_execution_failed: {pred_exc}",
+                predicted_execution_error=pred_exc,
                 reference_merged_output=sig_ref,
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),
+                reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS] if ref_err else None,
             )
 
         assert pred_nb is not None
         sig_pred = merged_output_signature(pred_nb, image_mode)
-        ok = merged_signatures_match(sig_ref, sig_pred)
-        detail = None
-        if not ok:
-            detail = json.dumps({"reference": sig_ref, "predicted": sig_pred}, default=str)[:4000]
+
+        task_text = _inputs_to_task_text(body.responses_create_params)
+        predicted_code_block = "\n\n---\n\n".join(pred_sources)
+
+        if ref_err:
+            reference_section = (
+                "(Reference notebook did not execute successfully; no reference output to compare.)\n"
+                f"Error:\n{ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS]}"
+            )
+        else:
+            assert sig_ref is not None
+            reference_section = json.dumps(redact_signature_for_judge(sig_ref, max_c), indent=2, default=str)
+
+        ok, evaluation = await self._run_llm_judge(
+            task_text=task_text,
+            reference_section=reference_section,
+            predicted_code=predicted_code_block,
+            predicted_signature=sig_pred,
+        )
+
+        reward = 1.0 if ok is True else 0.0
+        match = ok is True
+        comparison_detail = _comparison_detail_for_judge(ok, evaluation)
+        if ok is None and evaluation.verdict_label == "judge_parsing_error":
+            logger.error(
+                "Notebook judge did not return a parseable verdict (verdict_label=%s). reward=0.0.",
+                evaluation.verdict_label,
+            )
 
         return _verify_response(
             body,
-            reward=1.0 if ok else 0.0,
-            match=ok,
-            comparison_detail=detail,
+            reward=reward,
+            match=match,
+            comparison_detail=comparison_detail,
             reference_merged_output=sig_ref,
+            reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS] if ref_err else None,
+            predicted_execution_error=None,
             num_reference_code_cells=len(ref_sources),
             num_predicted_code_cells=len(pred_sources),
+            judge_evaluations=[evaluation],
         )
 
 
