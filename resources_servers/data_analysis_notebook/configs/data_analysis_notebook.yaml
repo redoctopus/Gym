@@ -23,7 +23,6 @@ data_analysis_notebook:
       judge_responses_create_params:
         input: []
         max_output_tokens: 1024
-        temperature: 0.0
       judge_endpoint_max_concurrency: 32
       judge_prompt_template_fpath: prompt_templates/notebook_task_judge.txt
       judge_max_output_chars: 12000

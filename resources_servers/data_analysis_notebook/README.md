@@ -44,7 +44,7 @@ Thinking wrappers (`</think>`, `<thinking>...</thinking>`) are removed before pa
 See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), `image_compare_mode` (`exact` | `none`) for building merged signatures (PNG lists), optional `execution_log_directory`, and **judge** settings:
 
 - `judge_model_server` — second `responses_api_models` instance (default YAML uses OpenAI-compatible `gpt-4o-mini` via `notebook_judge_model`).
-- `judge_responses_create_params` — typically low temperature; `max_output_tokens` large enough for `VERDICT:` + optional `REASON:`.
+- `judge_responses_create_params` — `max_output_tokens` large enough for `VERDICT:` + optional `REASON:`.
 - `judge_prompt_template_fpath` — rubric template under `prompt_templates/`.
 - `judge_max_output_chars` — per-field truncation for reference/predicted text sent to the judge.
 - `judge_probe_on_startup` — wait until the judge `/v1/responses` endpoint is reachable at startup (set `false` in tests).
