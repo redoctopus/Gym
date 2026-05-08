@@ -25,6 +25,7 @@ import re
 import shutil
 import uuid
 from asyncio import Semaphore, get_running_loop
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from time import sleep
@@ -68,8 +69,10 @@ class DataAnalysisNotebookResourcesServerConfig(BaseResourcesServerConfig):
     execute_timeout_secs: int = 120
     wall_clock_margin_secs: int = 90
     image_compare_mode: Literal["exact", "none"] = "exact"
-    # When set, each successful /verify with logging metadata writes {stem}_reference.log and
-    # {stem}_predicted.log under this directory (server machine). VerifierMetadata may override.
+    # When set, each /verify with logging enabled writes
+    # `<YYYY-mm-dd_HH-MM-SS_ffffff>_{stem}_reference.log` and the same prefix for `_predicted.log`
+    # directly under this directory (server machine). Stem defaults from task / data_paths /
+    # notebook metadata unless overridden in metadata. VerifierMetadata may override the directory.
     execution_log_directory: Optional[str] = None
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
@@ -86,7 +89,8 @@ class VerifierMetadata(BaseModel):
     data_paths: Optional[list[dict[str, str]]] = None
     # Server-side path; if set, overrides `execution_log_directory` from resources server config.
     execution_log_directory: Optional[str] = None
-    # Basename for `{stem}_reference.log` and `{stem}_predicted.log`; if unset, a unique id is used.
+    # Suffix in log filenames after the datetime prefix. If unset or invalid, derived from task
+    # text, data_paths filenames, and notebook metadata.
     execution_log_stem: Optional[str] = None
 
 
@@ -154,6 +158,14 @@ def _verify_response(
 
 # Task log header: first line of the user message only, at most this many characters.
 _MAX_TASK_QUESTION_LOG_EXCERPT_CHARS = 500
+# Log filename stem: total cap; per-fragment caps when composing from task / paths / metadata.
+_MAX_EXECUTION_LOG_STEM_CHARS = 80
+_MAX_EXECUTION_LOG_STEM_TASK_FRAGMENT_CHARS = 56
+_MAX_EXECUTION_LOG_STEM_DATA_FRAGMENT_CHARS = 28
+_MAX_EXECUTION_LOG_STEM_NOTEBOOK_FRAGMENT_CHARS = 40
+
+_UNSAFE_LOG_STEM_CHARS_RE = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+_LOG_STEM_WS_RE = re.compile(r"\s+")
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -657,19 +669,29 @@ def execute_notebook_cells_process(
     )
     proc.start()
     limit = timeout * max(len(sources), 1) + wall_margin
-    proc.join(timeout=limit)
+    # IMPORTANT: Drain the queue BEFORE join(). If the pipe buffer gets filled the child is deadlocked
+    # in Queue.put(), while the parent waits in join() until timeout.
+    try:
+        status, payload = q.get(timeout=limit)
+    except queue.Empty:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(2)
+            return None, f"Notebook execution exceeded wall-clock limit ({limit}s)"
+        proc.join(timeout=5)
+        return None, "Worker produced no result"
+
+    # Clean up child
+    proc.join(timeout=5)
     if proc.is_alive():
         proc.terminate()
         proc.join(5)
         if proc.is_alive():
             proc.kill()
             proc.join(2)
-        return None, f"Notebook execution exceeded wall-clock limit ({limit}s)"
-
-    try:
-        status, payload = q.get_nowait()
-    except queue.Empty:
-        return None, "Worker produced no result"
 
     if status == "ok":
         return nbformat.reads(payload, as_version=4), None
@@ -696,25 +718,108 @@ def _run_staging_and_execute(
         )
 
 
-def _execution_log_basename(execution_log_stem: Optional[str]) -> str:
-    """Return a single path segment for `{stem}_reference.log` / `{stem}_predicted.log`."""
-    raw = (execution_log_stem or "").strip()
-    if not raw or "/" in raw or "\\" in raw or ".." in raw or raw in (".", ".."):
+def _sanitize_execution_log_stem_fragment(s: str, max_len: int) -> str:
+    """Single filesystem-safe path segment fragment (no slashes); empty if nothing usable remains."""
+    s = s.strip()
+    if not s:
+        return ""
+    s = _LOG_STEM_WS_RE.sub("_", s)
+    s = _UNSAFE_LOG_STEM_CHARS_RE.sub("_", s)
+    s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
+    s = re.sub(r"_+", "_", s).strip("._-")
+    if not s or s in (".", ".."):
+        return ""
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("._-")
+    return s
+
+
+def _execution_log_stem_explicit_valid(raw: str) -> bool:
+    t = raw.strip()
+    return bool(t) and "/" not in t and "\\" not in t and ".." not in t and t not in (".", "..")
+
+
+def _data_paths_stem_hint(data_paths: Optional[list[dict[str, str]]], max_len: int) -> str:
+    if not data_paths:
+        return ""
+    for entry in data_paths:
+        if not isinstance(entry, dict):
+            continue
+        rel = (entry.get("path") or "").strip()
+        src = (entry.get("source") or "").strip()
+        for candidate in (rel, src):
+            if not candidate:
+                continue
+            base = Path(candidate).name
+            frag = _sanitize_execution_log_stem_fragment(base, max_len)
+            if frag:
+                return frag
+    return ""
+
+
+def _reference_notebook_stem_hint(nb: dict[str, Any], max_len: int) -> str:
+    md = nb.get("metadata")
+    if not isinstance(md, dict):
+        return ""
+    title = md.get("title")
+    if isinstance(title, str) and title.strip():
+        return _sanitize_execution_log_stem_fragment(title.strip(), max_len)
+    return ""
+
+
+def _resolve_execution_log_stem(
+    explicit: Optional[str],
+    params: NeMoGymResponseCreateParamsNonStreaming,
+    data_paths: Optional[list[dict[str, str]]],
+    reference_notebook: dict[str, Any],
+) -> str:
+    """Path-safe ``stem`` segment used in ``<datetime>_{stem}_reference.log`` (and ``_predicted``)."""
+    raw_explicit = (explicit or "").strip()
+    if raw_explicit and _execution_log_stem_explicit_valid(raw_explicit):
+        stem = _sanitize_execution_log_stem_fragment(raw_explicit, _MAX_EXECUTION_LOG_STEM_CHARS)
+        if stem:
+            return stem
+
+    parts: list[str] = []
+    task_ex = _task_question_excerpt_for_log(params)
+    if task_ex:
+        frag = _sanitize_execution_log_stem_fragment(task_ex, _MAX_EXECUTION_LOG_STEM_TASK_FRAGMENT_CHARS)
+        if frag:
+            parts.append(frag)
+    data_hint = _data_paths_stem_hint(data_paths, _MAX_EXECUTION_LOG_STEM_DATA_FRAGMENT_CHARS)
+    if data_hint:
+        parts.append(data_hint)
+    if not parts:
+        nb_hint = _reference_notebook_stem_hint(reference_notebook, _MAX_EXECUTION_LOG_STEM_NOTEBOOK_FRAGMENT_CHARS)
+        if nb_hint:
+            parts.append(nb_hint)
+    if not parts:
         return uuid.uuid4().hex
-    return raw
+    stem = _sanitize_execution_log_stem_fragment("_".join(parts), _MAX_EXECUTION_LOG_STEM_CHARS)
+    return stem if stem else uuid.uuid4().hex
 
 
 def _prepare_execution_log_paths(
     log_dir: Optional[str],
-    execution_log_stem: Optional[str],
+    stem: str,
 ) -> tuple[Optional[Path], Optional[Path]]:
-    """If ``log_dir`` is set, ensure it exists and return (reference, predicted) log file paths."""
+    """If ``log_dir`` is set, return (reference, predicted) log paths under that root with datetime prefix."""
     if not (log_dir or "").strip():
         return None, None
     base = Path(log_dir).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True)
-    stem = _execution_log_basename(execution_log_stem)
-    return base / f"{stem}_reference.log", base / f"{stem}_predicted.log"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    safe_stem = stem.strip() or uuid.uuid4().hex
+    for i in range(8):
+        unique = f"{uuid.uuid4().hex[:8]}_" if i else ""
+        prefix = f"{stamp}_{unique}{safe_stem}"
+        ref = base / f"{prefix}_reference.log"
+        pred = base / f"{prefix}_predicted.log"
+        if not ref.exists() and not pred.exists():
+            return ref, pred
+    stamp2 = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    prefix2 = f"{stamp2}_{uuid.uuid4().hex[:8]}_{safe_stem}"
+    return base / f"{prefix2}_reference.log", base / f"{prefix2}_predicted.log"
 
 
 class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
@@ -853,7 +958,13 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         log_dir = meta.execution_log_directory or self.config.execution_log_directory
         if (log_dir or "").strip() == "":
             log_dir = None
-        ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, meta.execution_log_stem)
+        log_stem = _resolve_execution_log_stem(
+            meta.execution_log_stem,
+            body.responses_create_params,
+            meta.data_paths,
+            meta.reference_notebook,
+        )
+        ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, log_stem)
         log_task = _task_question_excerpt_for_log(body.responses_create_params) if ref_log_path else None
 
         def _execute_staged(sources: list[str], log_p: Optional[Path]) -> tuple[Optional[NotebookNode], Optional[str]]:

@@ -27,6 +27,7 @@ from app import (
     DataAnalysisNotebookVerifyResponse,
     _first_line_excerpt_for_log,
     _previous_output_excerpt,
+    _resolve_execution_log_stem,
     _task_question_excerpt_for_log,
     extract_predicted_code_cells,
     extract_reference_code_sources,
@@ -286,6 +287,54 @@ class TestRedactSignatureForJudge:
         assert "pngs" not in out
 
 
+class TestExecutionLogStem:
+    def test_explicit_stem_sanitized(self) -> None:
+        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+            {"input": [{"type": "message", "role": "user", "content": "ignored"}], "parallel_tool_calls": False}
+        )
+        stem = _resolve_execution_log_stem("  My Run #1  ", params, None, {})
+        assert stem == "My_Run_1"
+
+    def test_derived_from_task_and_data_path(self) -> None:
+        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+            {
+                "input": [{"type": "message", "role": "user", "content": "Summarize the dataset."}],
+                "parallel_tool_calls": False,
+            }
+        )
+        stem = _resolve_execution_log_stem(
+            None,
+            params,
+            [{"source": "/mnt/d.csv", "path": "custom/subset.csv"}],
+            {},
+        )
+        assert stem.startswith("Summarize_the_dataset")
+        assert "subset.csv" in stem
+
+    def test_invalid_explicit_falls_through_to_task(self) -> None:
+        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+            {
+                "input": [{"type": "message", "role": "user", "content": "Valid line for stem."}],
+                "parallel_tool_calls": False,
+            }
+        )
+        stem = _resolve_execution_log_stem("../evil", params, None, {})
+        assert "Valid_line_for_stem" in stem
+
+    def test_notebook_title_when_no_user_text(self) -> None:
+        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+            {"input": [{"type": "message", "role": "user", "content": "  "}], "parallel_tool_calls": False}
+        )
+        nb = {
+            "metadata": {"title": "Kaggle Starter Notebook"},
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "cells": [],
+        }
+        stem = _resolve_execution_log_stem(None, params, None, nb)
+        assert "Kaggle_Starter_Notebook" in stem
+
+
 class TestVerifyIntegration:
     async def test_verify_pass_matching_code(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -418,8 +467,10 @@ class TestVerifyIntegration:
             res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert r.status_code == 200
         assert res.reward == 1.0
-        ref_log = log_dir / "task_smoke_reference.log"
-        pred_log = log_dir / "task_smoke_predicted.log"
+        ref_logs = sorted(log_dir.glob("*_task_smoke_reference.log"))
+        pred_logs = sorted(log_dir.glob("*_task_smoke_predicted.log"))
+        assert len(ref_logs) == 1 and len(pred_logs) == 1
+        ref_log, pred_log = ref_logs[0], pred_logs[0]
         assert ref_log.is_file() and pred_log.is_file()
         out_ref = ref_log.read_text(encoding="utf-8")
         out_pred = pred_log.read_text(encoding="utf-8")
