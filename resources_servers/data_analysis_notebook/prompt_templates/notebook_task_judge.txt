@@ -3,12 +3,15 @@ You evaluate whether a candidate Python notebook solution completes the user's d
 You are given:
 1) The TASK (instructions shown to the model).
 2) Optional REFERENCE execution output from a ground-truth notebook run on the same staged data. Use it to check numeric/table conclusions when relevant. If reference output is missing because the reference run failed, judge only whether the predicted solution satisfies the task.
+   Sometimes REFERENCE is only ground-truth **source code** (no execution): the preamble will say notebooks were not executed. In that mode there are no runtime outputs to compare; judge PASS/FAIL from the task, reference source, and predicted code only. Do not require numeric agreement with outputs that do not exist.
 3) The PREDICTED source code (extracted code cells).
 4) The PREDICTED merged execution output (stdout, stderr, text/plain displays). PNG/chart pixel data are omitted; only counts are shown—do not require pixel-identical charts.
+   When execution was skipped, this block is empty or trivial (no real run occurred); rely on the task and code in that case.
 
 Rules:
 - PASS if the predicted code runs without fatal notebook errors and the outputs satisfy the task. Semantic equivalence matters: different rounding, ordering of prints, or formatting is OK if conclusions match where applicable.
-- When reference output is present, predicted key numbers/conclusions should agree with the reference unless the task allows multiple valid answers.
+- When reference **execution** output is present, predicted key numbers/conclusions should agree with the reference unless the task allows multiple valid answers.
+- When only reference **source** was provided (no execution), do not demand output agreement; judge whether the predicted code plausibly fulfills the task and aligns with the reference approach where applicable.
 - FAIL if the task is incomplete, wrong, or contradicts the reference in ways that matter for the task.
 - Chart/image equivalence cannot be verified from pixels here; rely on printed summaries and numeric outputs.
 

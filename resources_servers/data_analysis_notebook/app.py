@@ -68,6 +68,9 @@ class DataAnalysisNotebookResourcesServerConfig(BaseResourcesServerConfig):
     max_concurrent_executions: int = 2
     execute_timeout_secs: int = 120
     wall_clock_margin_secs: int = 90
+    # When true, skip staging and subprocess execution for reference and predicted code; the judge
+    # sees task text, reference source, predicted code, and empty execution signatures only.
+    skip_notebook_execution: bool = False
     image_compare_mode: Literal["exact", "none"] = "exact"
     # When set, each /verify with logging enabled writes
     # `<YYYY-mm-dd_HH-MM-SS_ffffff>_{stem}_reference.log` and the same prefix for `_predicted.log`
@@ -92,6 +95,8 @@ class VerifierMetadata(BaseModel):
     # Suffix in log filenames after the datetime prefix. If unset or invalid, derived from task
     # text, data_paths filenames, and notebook metadata.
     execution_log_stem: Optional[str] = None
+    # If set, overrides `skip_notebook_execution` from resources server config for this request.
+    skip_notebook_execution: Optional[bool] = None
 
 
 class DataAnalysisNotebookVerifyRequest(BaseVerifyRequest):
@@ -254,6 +259,13 @@ def extract_reference_code_sources(reference_notebook: dict[str, Any]) -> list[s
         if src:
             sources.append(src)
     return sources
+
+
+def _notebook_from_code_sources(sources: list[str]) -> NotebookNode:
+    """Minimal nbformat notebook with code cells and no outputs (for empty merged signatures)."""
+    nb = nbformat.v4.new_notebook()
+    nb.cells = [nbformat.v4.new_code_cell(s) for s in sources]
+    return nb
 
 
 def _stage_data_paths(target: Path, data_paths: Optional[list[dict[str, str]]]) -> Optional[str]:
@@ -479,12 +491,71 @@ _MAX_CELL_SOURCE_LOG_CHARS = 8_000
 _MAX_LOG_BLOCK_CHARS = 120_000
 
 
-def _write_execution_log_session_header(log_fh: TextIO, log_task_excerpt: Optional[str], cwd: Path) -> None:
+def _write_execution_log_session_header(
+    log_fh: TextIO,
+    log_task_excerpt: Optional[str],
+    cwd: Optional[Path],
+    *,
+    execution_skipped: bool = False,
+) -> None:
     if log_task_excerpt:
         log_fh.write("# Task question\n")
         log_fh.write(log_task_excerpt.strip() + "\n\n")
-    log_fh.write(f"Execution log (cwd={cwd})\n")
+    if execution_skipped:
+        log_fh.write(
+            "# Notebook execution was skipped for this verify (skip_notebook_execution); "
+            "sources below were not run in a kernel.\n\n"
+        )
+    else:
+        assert cwd is not None
+        log_fh.write(f"Execution log (cwd={cwd})\n")
     log_fh.flush()
+
+
+def _write_skip_mode_execution_logs(
+    ref_log_path: Optional[Path],
+    pred_log_path: Optional[Path],
+    log_task_excerpt: Optional[str],
+    ref_sources: list[str],
+    pred_sources: list[str],
+    image_mode: Literal["exact", "none"],
+) -> None:
+    """Append reference / predicted code-cell sources to optional log files when execution is skipped."""
+
+    def _write_cells(path: Optional[Path], sources: list[str]) -> None:
+        if path is None:
+            return
+        with open(path, "a", encoding="utf-8", buffering=1) as log_fh:
+            _write_execution_log_session_header(log_fh, log_task_excerpt, None, execution_skipped=True)
+            for i, raw_src in enumerate(sources):
+                src = raw_src
+                if isinstance(src, list):
+                    src = "".join(src)
+                src = str(src)
+                if len(src) > _MAX_CELL_SOURCE_LOG_CHARS:
+                    src = src[:_MAX_CELL_SOURCE_LOG_CHARS] + "\n... [truncated] ...\n"
+                one_cell_nb = nbformat.v4.new_notebook()
+                one_cell_nb.metadata = {}
+                one_cell_nb.cells = [nbformat.v4.new_code_cell(src)]
+                sig = merged_output_signature(one_cell_nb, image_mode)
+                try:
+                    sig_json = json.dumps(sig, indent=2, default=str)
+                except (TypeError, ValueError) as e:  # pragma: no cover - defensive
+                    sig_json = f"<could not json-encode signature: {e!s}>"
+                if len(sig_json) > _MAX_LOG_BLOCK_CHARS:
+                    sig_json = sig_json[:_MAX_LOG_BLOCK_CHARS] + "\n... [truncated] ...\n"
+                log_fh.write(
+                    f"---\n# Code cell {i} (0-based) — not executed (verify skipped notebook execution)\n"
+                )
+                log_fh.write("## Source\n")
+                log_fh.write(src)
+                log_fh.write("\n## Output (this cell only, PNG omitted from JSON)\n")
+                log_fh.write(sig_json)
+                log_fh.write("\n")
+                log_fh.flush()
+
+    _write_cells(ref_log_path, ref_sources)
+    _write_cells(pred_log_path, pred_sources)
 
 
 def _append_completed_cell_to_execution_log(log_fh: TextIO, code_cell_index: int, nb: NotebookNode) -> None:
@@ -949,11 +1020,74 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 num_reference_code_cells=len(ref_sources),
             )
 
-        loop = get_running_loop()
+        skip_exec = (
+            meta.skip_notebook_execution
+            if meta.skip_notebook_execution is not None
+            else self.config.skip_notebook_execution
+        )
+
         timeout = self.config.execute_timeout_secs
         margin = self.config.wall_clock_margin_secs
         image_mode = self.config.image_compare_mode
         max_c = self.config.judge_max_output_chars
+
+        if skip_exec:
+            log_dir = meta.execution_log_directory or self.config.execution_log_directory
+            if (log_dir or "").strip() == "":
+                log_dir = None
+            log_stem = _resolve_execution_log_stem(
+                meta.execution_log_stem,
+                body.responses_create_params,
+                meta.data_paths,
+                meta.reference_notebook,
+            )
+            ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, log_stem)
+            log_task = _task_question_excerpt_for_log(body.responses_create_params) if (
+                ref_log_path or pred_log_path
+            ) else None
+            _write_skip_mode_execution_logs(
+                ref_log_path,
+                pred_log_path,
+                log_task,
+                ref_sources,
+                pred_sources,
+                image_mode,
+            )
+            task_text = _inputs_to_task_text(body.responses_create_params)
+            predicted_code_block = "\n\n---\n\n".join(pred_sources)
+            joined_ref = "\n\n---\n\n".join(ref_sources)
+            reference_section = (
+                "(Ground-truth reference code only; notebooks were not executed. "
+                "No runtime outputs. The predicted execution block below is empty. "
+                "Decide PASS/FAIL from the task and code alone.)\n\n" + _truncate_for_judge(joined_ref, max_c * 2)
+            )
+            sig_pred = merged_output_signature(_notebook_from_code_sources(pred_sources), image_mode)
+            ok, evaluation = await self._run_llm_judge(
+                task_text=task_text,
+                reference_section=reference_section,
+                predicted_code=predicted_code_block,
+                predicted_signature=sig_pred,
+            )
+            reward = 1.0 if ok is True else 0.0
+            match = ok is True
+            comparison_detail = _comparison_detail_for_judge(ok, evaluation)
+            if ok is None and evaluation.verdict_label == "judge_parsing_error":
+                logger.error(
+                    "Notebook judge did not return a parseable verdict (verdict_label=%s). reward=0.0.",
+                    evaluation.verdict_label,
+                )
+            return _verify_response(
+                body,
+                reward=reward,
+                match=match,
+                comparison_detail=comparison_detail,
+                reference_merged_output=None,
+                reference_execution_error=None,
+                predicted_execution_error=None,
+                num_reference_code_cells=len(ref_sources),
+                num_predicted_code_cells=len(pred_sources),
+                judge_evaluations=[evaluation],
+            )
 
         log_dir = meta.execution_log_directory or self.config.execution_log_directory
         if (log_dir or "").strip() == "":
@@ -977,6 +1111,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 log_task_excerpt=log_task,
             )
 
+        loop = get_running_loop()
         async with self._semaphore:
             ref_nb, ref_err = await loop.run_in_executor(None, partial(_execute_staged, ref_sources, ref_log_path))
             pred_nb, pred_err = await loop.run_in_executor(None, partial(_execute_staged, pred_sources, pred_log_path))

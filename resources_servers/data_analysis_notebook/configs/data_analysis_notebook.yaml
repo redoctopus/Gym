@@ -13,6 +13,8 @@ data_analysis_notebook:
       domain: coding
       verified: false
       description: Data analysis tasks verified by executing notebooks and LLM judge vs reference output
+      # When true, skip execution; judge from task + reference source + predicted code + empty outputs.
+      skip_notebook_execution: false
       max_concurrent_executions: 2
       execute_timeout_secs: 120
       wall_clock_margin_secs: 90

@@ -16,7 +16,7 @@
 import tempfile
 from pathlib import Path
 from typing import Any, Generator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import nbformat
 import pytest
@@ -26,6 +26,7 @@ from app import (
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
     _first_line_excerpt_for_log,
+    _notebook_from_code_sources,
     _previous_output_excerpt,
     _resolve_execution_log_stem,
     _task_question_excerpt_for_log,
@@ -231,6 +232,14 @@ class TestMergedSignature:
         nb.cells = [c]
         sig = merged_output_signature(nb, "exact")
         assert sig["text_merged"] == "printed\nrepr_value"
+
+    def test_notebook_from_code_sources_empty_merged_signature(self) -> None:
+        nb = _notebook_from_code_sources(["print(1)", "x = 2"])
+        sig = merged_output_signature(nb, "exact")
+        assert sig["text_merged"] == ""
+        assert sig["stderr_merged"] == ""
+        assert sig["pngs"] == []
+        assert sig["errors"] == []
 
     def test_previous_output_excerpt_trailing_lines(self) -> None:
         nb = nbformat.v4.new_notebook()
@@ -479,6 +488,144 @@ class TestVerifyIntegration:
         assert "# Task question" in out_ref
         assert "Print hello" in out_ref
         assert "# Task question" in out_pred
+
+    async def test_verify_skip_execution_does_not_call_runner(self) -> None:
+        def _fail_run(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("_run_staging_and_execute must not run when skip_notebook_execution")
+
+        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+            with _make_test_client("VERDICT: PASS\nREASON: ok") as client:
+                body = DataAnalysisNotebookVerifyRequest(
+                    responses_create_params={
+                        "input": [{"role": "user", "content": "Do the task."}],
+                        "parallel_tool_calls": False,
+                    },
+                    response=_assistant_response("```python\nprint(1)\n```"),
+                    verifier_metadata={
+                        "reference_notebook": _ref_nb("print(2)"),
+                        "skip_notebook_execution": True,
+                    },
+                )
+                r = client.post("/verify", json=body.model_dump())
+        assert r.status_code == 200
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 1.0
+        assert res.match is True
+        assert res.reference_merged_output is None
+        assert res.reference_execution_error is None
+        assert res.predicted_execution_error is None
+
+    async def test_verify_skip_execution_writes_log_files_when_log_dir_set(self, tmp_path: Path) -> None:
+        log_dir = tmp_path / "skip_logs"
+        log_dir.mkdir()
+
+        def _fail_run(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("_run_staging_and_execute must not run when skip_notebook_execution")
+
+        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+            mock = _stub_server_client()
+            _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
+            server = DataAnalysisNotebookResourcesServer(
+                config=_default_dan_config(
+                    skip_notebook_execution=True,
+                    execution_log_directory=str(log_dir),
+                ),
+                server_client=mock,
+            )
+            app = server.setup_webserver()
+            with TestClient(app) as client:
+                body = DataAnalysisNotebookVerifyRequest(
+                    responses_create_params={
+                        "input": [{"role": "user", "content": "Skip log stem task."}],
+                        "parallel_tool_calls": False,
+                    },
+                    response=_assistant_response("```python\nprint('pred_skip_marker')\n```"),
+                    verifier_metadata={
+                        "reference_notebook": _ref_nb("print('ref_skip_marker')"),
+                        "execution_log_stem": "skip_log_stem",
+                    },
+                )
+                r = client.post("/verify", json=body.model_dump())
+        assert r.status_code == 200
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 1.0
+        ref_logs = sorted(log_dir.glob("*_skip_log_stem_reference.log"))
+        pred_logs = sorted(log_dir.glob("*_skip_log_stem_predicted.log"))
+        assert len(ref_logs) == 1 and len(pred_logs) == 1
+        out_ref = ref_logs[0].read_text(encoding="utf-8")
+        out_pred = pred_logs[0].read_text(encoding="utf-8")
+        assert "skip_notebook_execution" in out_ref and "skip_notebook_execution" in out_pred
+        assert "ref_skip_marker" in out_ref
+        assert "pred_skip_marker" in out_pred
+        assert "not executed (verify skipped notebook execution)" in out_ref
+        assert "# Task question" in out_ref
+        assert "Skip log stem task" in out_ref
+
+    async def test_verify_skip_invalid_python_still_calls_judge(self) -> None:
+        """Skip mode never executes; invalid syntax is not surfaced as predicted_execution_error."""
+
+        def _fail_run(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("no execution")
+
+        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+            with _make_test_client("VERDICT: PASS\nREASON: ok") as client:
+                body = DataAnalysisNotebookVerifyRequest(
+                    responses_create_params={
+                        "input": [{"role": "user", "content": "x"}],
+                        "parallel_tool_calls": False,
+                    },
+                    response=_assistant_response("```python\n*** not valid\n```"),
+                    verifier_metadata={
+                        "reference_notebook": _ref_nb("print(1)"),
+                        "skip_notebook_execution": True,
+                    },
+                )
+                r = client.post("/verify", json=body.model_dump())
+        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
+        assert res.reward == 1.0
+        assert res.predicted_execution_error is None
+
+    def test_skip_metadata_false_overrides_config_true(self) -> None:
+        calls = 0
+
+        def fake_run(
+            sources: list[str],
+            data_paths: Any,
+            timeout: int,
+            margin: int,
+            log_path: Any = None,
+            log_task_excerpt: Any = None,
+        ) -> tuple[Any, None]:
+            nonlocal calls
+            calls += 1
+            nb = nbformat.v4.new_notebook()
+            c = nbformat.v4.new_code_cell("x")
+            c.outputs = [new_output("stream", name="stdout", text="ok\n")]
+            nb.cells = [c]
+            return nb, None
+
+        mock = _stub_server_client()
+        _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
+        server = DataAnalysisNotebookResourcesServer(
+            config=_default_dan_config(skip_notebook_execution=True),
+            server_client=mock,
+        )
+        with patch("app._run_staging_and_execute", side_effect=fake_run):
+            with TestClient(server.setup_webserver()) as client:
+                body = DataAnalysisNotebookVerifyRequest(
+                    responses_create_params={
+                        "input": [{"role": "user", "content": "x"}],
+                        "parallel_tool_calls": False,
+                    },
+                    response=_assistant_response("```python\nprint(1)\n```"),
+                    verifier_metadata={
+                        "reference_notebook": _ref_nb("print(1)"),
+                        "skip_notebook_execution": False,
+                    },
+                )
+                r = client.post("/verify", json=body.model_dump())
+        assert r.status_code == 200
+        assert calls == 2
 
 
 class TestJudgeFailure:
