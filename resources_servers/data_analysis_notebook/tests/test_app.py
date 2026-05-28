@@ -33,10 +33,9 @@ from app import (
     extract_predicted_code_cells,
     extract_reference_code_sources,
     merged_output_signature,
-    parse_notebook_judge_verdict,
-    redact_signature_for_judge,
 )
 from fastapi.testclient import TestClient
+from judge import parse_notebook_judge_verdict, redact_signature_for_judge
 from nbformat.v4 import new_output
 from pydantic import ValidationError
 

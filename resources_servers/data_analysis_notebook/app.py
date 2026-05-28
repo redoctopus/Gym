@@ -20,9 +20,11 @@ import base64
 import json
 import logging
 import multiprocessing
+import os
 import queue
 import re
 import shutil
+import tempfile
 import uuid
 from asyncio import Semaphore, get_running_loop
 from datetime import datetime
@@ -33,12 +35,22 @@ from typing import Any, Literal, Optional, TextIO
 
 import nbformat
 import requests
+from judge import (
+    NotebookJudgeEvaluation,
+    comparison_detail_for_judge,
+    fill_notebook_judge_prompt,
+    inputs_to_task_text,
+    last_assistant_output_text,
+    parse_notebook_judge_verdict,
+    redact_signature_for_judge,
+    truncate_for_judge,
+)
 from jupyter_client.utils import ensure_async
 from jupyter_core.utils import run_sync
 from nbclient import NotebookClient
 from nbclient.exceptions import CellTimeoutError
 from nbformat.notebooknode import NotebookNode
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -101,15 +113,6 @@ class VerifierMetadata(BaseModel):
 
 class DataAnalysisNotebookVerifyRequest(BaseVerifyRequest):
     verifier_metadata: dict[str, Any]
-
-
-class NotebookJudgeEvaluation(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    responses_create_params: NeMoGymResponseCreateParamsNonStreaming
-    response: Optional[NeMoGymResponse] = None
-    verdict_label: Optional[str] = None
-    reason: Optional[str] = None
 
 
 class DataAnalysisNotebookVerifyResponse(BaseVerifyResponse):
@@ -216,13 +219,6 @@ def _task_question_excerpt_for_log(params: NeMoGymResponseCreateParamsNonStreami
     return ""
 
 
-def _strip_thinking(text: str) -> str:
-    if "</think>" in text:
-        text = _THINKING_SPLIT_RE.split(text)[-1]
-    text = _XML_THINKING_RE.sub("", text)
-    return text.strip()
-
-
 def _assistant_output_text(response: NeMoGymResponse) -> str:
     parts: list[str] = []
     for output in response.output:
@@ -231,7 +227,9 @@ def _assistant_output_text(response: NeMoGymResponse) -> str:
         for content in output.content:
             if content.type == "output_text":
                 parts.append(content.text)
-    return _strip_thinking("".join(parts))
+    text = _THINKING_SPLIT_RE.split("".join(parts))[-1]
+    text = _XML_THINKING_RE.sub("", text)
+    return text.strip()
 
 
 def extract_predicted_code_cells(text: str) -> list[str]:
@@ -246,16 +244,19 @@ def extract_predicted_code_cells(text: str) -> list[str]:
     return cells
 
 
+def _normalize_cell_source(src: Any) -> str:
+    if isinstance(src, list):
+        src = "".join(src)
+    return str(src).strip()
+
+
 def extract_reference_code_sources(reference_notebook: dict[str, Any]) -> list[str]:
     nb = nbformat.from_dict(reference_notebook)
     sources: list[str] = []
     for cell in nb.cells:
         if cell.get("cell_type") != "code":
             continue
-        src = cell.get("source", "")
-        if isinstance(src, list):
-            src = "".join(src)
-        src = str(src).strip()
+        src = _normalize_cell_source(cell.get("source", ""))
         if src:
             sources.append(src)
     return sources
@@ -349,10 +350,7 @@ def merged_output_signature(nb: NotebookNode, image_mode: Literal["exact", "none
             continue
         for rec in _canonicalize_cell_outputs(cell):
             if rec["kind"] == "stream":
-                if rec["name"] == "stderr":
-                    stderr_chunks.append(rec["text"])
-                else:
-                    text_chunks.append(rec["text"])
+                (stderr_chunks if rec["name"] == "stderr" else text_chunks).append(rec["text"])
             elif rec["kind"] == "plain":
                 text_chunks.append(rec["text"])
             elif rec["kind"] == "png":
@@ -369,126 +367,46 @@ def merged_output_signature(nb: NotebookNode, image_mode: Literal["exact", "none
     }
 
 
-_JUDGE_VERDICT_PASS_RE = re.compile(r"^\s*VERDICT:\s*PASS\s*$", re.MULTILINE | re.IGNORECASE)
-_JUDGE_VERDICT_FAIL_RE = re.compile(r"^\s*VERDICT:\s*FAIL\s*$", re.MULTILINE | re.IGNORECASE)
-_JUDGE_REASON_RE = re.compile(r"^\s*REASON:\s*(.+?)(?:\n|$)", re.MULTILINE | re.DOTALL | re.IGNORECASE)
-
-
-def _truncate_for_judge(s: str, max_chars: int) -> str:
-    s = s or ""
-    if len(s) <= max_chars:
-        return s
-    return s[: max_chars - 20] + "\n...[truncated]...\n"
-
-
-def redact_signature_for_judge(sig: dict[str, Any], max_chars_per_field: int) -> dict[str, Any]:
-    """Drop PNG payloads; truncate text fields for the judge prompt."""
-    pngs = sig.get("pngs") or []
-    png_note = f"{len(pngs)} PNG figure(s); pixel data omitted."
-    errors = sig.get("errors") or []
-    err_out: list[dict[str, Any]] = []
-    for e in errors[:50]:
-        tb = e.get("traceback") or []
-        if isinstance(tb, list) and len(tb) > 30:
-            tb = tb[-30:]
-        err_out.append(
-            {
-                "ename": e.get("ename", ""),
-                "evalue": _truncate_for_judge(str(e.get("evalue", "")), max_chars_per_field),
-                "traceback": tb,
-            }
-        )
-    return {
-        "text_merged": _truncate_for_judge(str(sig.get("text_merged") or ""), max_chars_per_field),
-        "stderr_merged": _truncate_for_judge(str(sig.get("stderr_merged") or ""), max_chars_per_field),
-        "png_summary": png_note,
-        "errors": err_out,
-    }
-
-
-def parse_notebook_judge_verdict(text: str) -> tuple[Optional[bool], Optional[str], Optional[str]]:
-    """Parse VERDICT line and optional REASON. Returns (passed, verdict_label, reason)."""
-    has_pass = bool(_JUDGE_VERDICT_PASS_RE.search(text))
-    has_fail = bool(_JUDGE_VERDICT_FAIL_RE.search(text))
-    reason_m = _JUDGE_REASON_RE.search(text)
-    reason = reason_m.group(1).strip() if reason_m else None
-    if has_pass == has_fail:
-        return None, "judge_parsing_error", reason
-    if has_pass:
-        return True, "pass", reason
-    return False, "fail", reason
-
-
-def _inputs_to_task_text(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
-    """Serialize conversation input into one string for the judge."""
-    inp = params.input
-    if isinstance(inp, str):
-        return inp.strip()
-    lines: list[str] = []
-    for m in inp:
-        if getattr(m, "type", None) != "message":
-            continue
-        role = getattr(m, "role", None)
-        raw = _message_content_to_text(getattr(m, "content", None))
-        if raw:
-            lines.append(f"{role}:\n{raw}")
-    return "\n\n".join(lines).strip() or "(empty task)"
-
-
-def _resolve_judge_prompt_path(config_path: str) -> Path:
-    p = Path(config_path)
-    if p.is_absolute():
-        return p
-    return Path(__file__).resolve().parent / p
-
-
-def _last_assistant_output_text(resp: NeMoGymResponse) -> Optional[str]:
-    try:
-        last_output = resp.output[-1]
-        if getattr(last_output, "type", None) != "message":
-            return None
-        last_content = last_output.content[-1]
-        return getattr(last_content, "text", "") or ""
-    except Exception:
-        return None
-
-
-def _fill_notebook_judge_prompt(
-    template: str,
-    *,
-    task_text: str,
-    reference_section: str,
-    predicted_code: str,
-    predicted_signature_json: str,
-) -> str:
-    return (
-        template.replace("{task_text}", task_text)
-        .replace("{reference_section}", reference_section)
-        .replace("{predicted_code}", predicted_code)
-        .replace("{predicted_signature_json}", predicted_signature_json)
-    )
-
-
-def _comparison_detail_for_judge(ok: Optional[bool], evaluation: NotebookJudgeEvaluation) -> str:
-    parts: list[str] = []
-    if evaluation.reason:
-        parts.append(evaluation.reason)
-    if evaluation.verdict_label and evaluation.verdict_label != "pass":
-        parts.append(f"verdict_label={evaluation.verdict_label}")
-    if parts:
-        return "; ".join(parts)
-    if ok is True:
-        return "pass"
-    if ok is None:
-        return f"judge_did_not_resolve verdict_label={evaluation.verdict_label or 'unknown'}"
-    return f"fail verdict_label={evaluation.verdict_label or 'unknown'}"
-
-
 # Lines of prior stdout/plain/stderr to include when a code cell times out.
 _PREVIOUS_OUTPUT_PREVIEW_LINES = 5
-_REFERENCE_EXEC_ERR_MAX_CHARS = 5000
+_EXEC_ERR_MAX_CHARS = 5000
 _MAX_CELL_SOURCE_LOG_CHARS = 8_000
 _MAX_LOG_BLOCK_CHARS = 120_000
+
+
+def _signature_json_for_log(nb: NotebookNode, image_mode: Literal["exact", "none"]) -> str:
+    sig = merged_output_signature(nb, image_mode)
+    try:
+        sig_json = json.dumps(sig, indent=2, default=str)
+    except (TypeError, ValueError) as e:  # pragma: no cover - defensive
+        sig_json = f"<could not json-encode signature: {e!s}>"
+    if len(sig_json) > _MAX_LOG_BLOCK_CHARS:
+        sig_json = sig_json[:_MAX_LOG_BLOCK_CHARS] + "\n... [truncated] ...\n"
+    return sig_json
+
+
+def _write_code_cell_log_block(
+    log_fh: TextIO,
+    code_cell_index: int,
+    src: str,
+    header_line: str,
+    image_mode: Literal["exact", "none"],
+    *,
+    executed_cell: Optional[NotebookNode] = None,
+) -> None:
+    if len(src) > _MAX_CELL_SOURCE_LOG_CHARS:
+        src = src[:_MAX_CELL_SOURCE_LOG_CHARS] + "\n... [truncated] ...\n"
+    one_cell_nb = nbformat.v4.new_notebook()
+    one_cell_nb.metadata = {}
+    one_cell_nb.cells = [executed_cell if executed_cell is not None else nbformat.v4.new_code_cell(src)]
+    sig_json = _signature_json_for_log(one_cell_nb, image_mode)
+    log_fh.write(f"---\n{header_line}\n")
+    log_fh.write("## Source\n")
+    log_fh.write(src)
+    log_fh.write("\n## Output (this cell only, PNG omitted from JSON)\n")
+    log_fh.write(sig_json)
+    log_fh.write("\n")
+    log_fh.flush()
 
 
 def _write_execution_log_session_header(
@@ -528,31 +446,13 @@ def _write_skip_mode_execution_logs(
         with open(path, "a", encoding="utf-8", buffering=1) as log_fh:
             _write_execution_log_session_header(log_fh, log_task_excerpt, None, execution_skipped=True)
             for i, raw_src in enumerate(sources):
-                src = raw_src
-                if isinstance(src, list):
-                    src = "".join(src)
-                src = str(src)
-                if len(src) > _MAX_CELL_SOURCE_LOG_CHARS:
-                    src = src[:_MAX_CELL_SOURCE_LOG_CHARS] + "\n... [truncated] ...\n"
-                one_cell_nb = nbformat.v4.new_notebook()
-                one_cell_nb.metadata = {}
-                one_cell_nb.cells = [nbformat.v4.new_code_cell(src)]
-                sig = merged_output_signature(one_cell_nb, image_mode)
-                try:
-                    sig_json = json.dumps(sig, indent=2, default=str)
-                except (TypeError, ValueError) as e:  # pragma: no cover - defensive
-                    sig_json = f"<could not json-encode signature: {e!s}>"
-                if len(sig_json) > _MAX_LOG_BLOCK_CHARS:
-                    sig_json = sig_json[:_MAX_LOG_BLOCK_CHARS] + "\n... [truncated] ...\n"
-                log_fh.write(
-                    f"---\n# Code cell {i} (0-based) — not executed (verify skipped notebook execution)\n"
+                _write_code_cell_log_block(
+                    log_fh,
+                    i,
+                    raw_src,
+                    f"# Code cell {i} (0-based) — not executed (verify skipped notebook execution)",
+                    image_mode,
                 )
-                log_fh.write("## Source\n")
-                log_fh.write(src)
-                log_fh.write("\n## Output (this cell only, PNG omitted from JSON)\n")
-                log_fh.write(sig_json)
-                log_fh.write("\n")
-                log_fh.flush()
 
     _write_cells(ref_log_path, ref_sources)
     _write_cells(pred_log_path, pred_sources)
@@ -563,29 +463,15 @@ def _append_completed_cell_to_execution_log(log_fh: TextIO, code_cell_index: int
     if code_cell_index < 0 or code_cell_index >= len(nb.cells):
         return
     cell = nb.cells[code_cell_index]
-    src = cell.get("source", "")
-    if isinstance(src, list):
-        src = "".join(src)
-    src = str(src)
-    if len(src) > _MAX_CELL_SOURCE_LOG_CHARS:
-        src = src[:_MAX_CELL_SOURCE_LOG_CHARS] + "\n... [truncated] ...\n"
-    one_cell_nb = nbformat.v4.new_notebook()
-    one_cell_nb.metadata = {}
-    one_cell_nb.cells = [cell]
-    sig = merged_output_signature(one_cell_nb, "none")
-    try:
-        sig_json = json.dumps(sig, indent=2, default=str)
-    except (TypeError, ValueError) as e:  # pragma: no cover - defensive
-        sig_json = f"<could not json-encode signature: {e!s}>"
-    if len(sig_json) > _MAX_LOG_BLOCK_CHARS:
-        sig_json = sig_json[:_MAX_LOG_BLOCK_CHARS] + "\n... [truncated] ...\n"
-    log_fh.write(f"---\n# Code cell {code_cell_index} (0-based) completed\n")
-    log_fh.write("## Source\n")
-    log_fh.write(src)
-    log_fh.write("\n## Output (this cell only, PNG omitted from JSON)\n")
-    log_fh.write(sig_json)
-    log_fh.write("\n")
-    log_fh.flush()
+    src = _normalize_cell_source(cell.get("source", ""))
+    _write_code_cell_log_block(
+        log_fh,
+        code_cell_index,
+        src,
+        f"# Code cell {code_cell_index} (0-based) completed",
+        "none",
+        executed_cell=cell,
+    )
 
 
 def _previous_output_excerpt(nb: NotebookNode, failing_code_cell_index: int, max_lines: int) -> str:
@@ -634,8 +520,6 @@ async def _async_execute_code_cells(
     log_path: Optional[Path] = None,
     log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
-    import os
-
     log_fh: Optional[TextIO] = None
     if log_path is not None:
         log_fh = open(log_path, "a", encoding="utf-8", buffering=1)
@@ -722,6 +606,17 @@ def _notebook_worker(
         result_queue.put(("err", f"{type(e).__name__}: {e}"))
 
 
+def _terminate_process(proc: multiprocessing.Process, *, join_timeout: float = 5) -> None:
+    if not proc.is_alive():
+        proc.join(timeout=join_timeout)
+        return
+    proc.terminate()
+    proc.join(5)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(2)
+
+
 def execute_notebook_cells_process(
     cwd: Path,
     sources: list[str],
@@ -746,23 +641,12 @@ def execute_notebook_cells_process(
         status, payload = q.get(timeout=limit)
     except queue.Empty:
         if proc.is_alive():
-            proc.terminate()
-            proc.join(5)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(2)
+            _terminate_process(proc)
             return None, f"Notebook execution exceeded wall-clock limit ({limit}s)"
         proc.join(timeout=5)
         return None, "Worker produced no result"
 
-    # Clean up child
-    proc.join(timeout=5)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(2)
+    _terminate_process(proc)
 
     if status == "ok":
         return nbformat.reads(payload, as_version=4), None
@@ -777,8 +661,6 @@ def _run_staging_and_execute(
     log_path: Optional[Path] = None,
     log_task_excerpt: Optional[str] = None,
 ) -> tuple[Optional[NotebookNode], Optional[str]]:
-    import tempfile
-
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         err = _stage_data_paths(cwd, data_paths)
@@ -803,11 +685,6 @@ def _sanitize_execution_log_stem_fragment(s: str, max_len: int) -> str:
     if len(s) > max_len:
         s = s[:max_len].rstrip("._-")
     return s
-
-
-def _execution_log_stem_explicit_valid(raw: str) -> bool:
-    t = raw.strip()
-    return bool(t) and "/" not in t and "\\" not in t and ".." not in t and t not in (".", "..")
 
 
 def _data_paths_stem_hint(data_paths: Optional[list[dict[str, str]]], max_len: int) -> str:
@@ -846,7 +723,13 @@ def _resolve_execution_log_stem(
 ) -> str:
     """Path-safe ``stem`` segment used in ``<datetime>_{stem}_reference.log`` (and ``_predicted``)."""
     raw_explicit = (explicit or "").strip()
-    if raw_explicit and _execution_log_stem_explicit_valid(raw_explicit):
+    if (
+        raw_explicit
+        and "/" not in raw_explicit
+        and "\\" not in raw_explicit
+        and ".." not in raw_explicit
+        and raw_explicit not in (".", "..")
+    ):
         stem = _sanitize_execution_log_stem_fragment(raw_explicit, _MAX_EXECUTION_LOG_STEM_CHARS)
         if stem:
             return stem
@@ -893,6 +776,70 @@ def _prepare_execution_log_paths(
     return base / f"{prefix2}_reference.log", base / f"{prefix2}_predicted.log"
 
 
+def _setup_execution_logging(
+    meta: VerifierMetadata,
+    params: NeMoGymResponseCreateParamsNonStreaming,
+    config: DataAnalysisNotebookResourcesServerConfig,
+    *,
+    task_excerpt_if_pred_log: bool,
+) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
+    log_dir_raw = meta.execution_log_directory or config.execution_log_directory
+    log_dir = log_dir_raw if (log_dir_raw or "").strip() else None
+    log_stem = _resolve_execution_log_stem(
+        meta.execution_log_stem,
+        params,
+        meta.data_paths,
+        meta.reference_notebook,
+    )
+    ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, log_stem)
+    if task_excerpt_if_pred_log:
+        log_task = _task_question_excerpt_for_log(params) if (ref_log_path or pred_log_path) else None
+    else:
+        log_task = _task_question_excerpt_for_log(params) if ref_log_path else None
+    return ref_log_path, pred_log_path, log_task
+
+
+def _judge_inputs_from_verify(
+    params: NeMoGymResponseCreateParamsNonStreaming,
+    pred_sources: list[str],
+) -> tuple[str, str]:
+    return inputs_to_task_text(params), "\n\n---\n\n".join(pred_sources)
+
+
+def _truncate_exec_error(err: Optional[str]) -> Optional[str]:
+    return err[:_EXEC_ERR_MAX_CHARS] if err else None
+
+
+def _finalize_judge_verification(
+    body: DataAnalysisNotebookVerifyRequest,
+    ok: Optional[bool],
+    evaluation: NotebookJudgeEvaluation,
+    *,
+    num_reference_code_cells: int,
+    num_predicted_code_cells: int,
+    reference_merged_output: Optional[dict[str, Any]] = None,
+    reference_execution_error: Optional[str] = None,
+    predicted_execution_error: Optional[str] = None,
+) -> DataAnalysisNotebookVerifyResponse:
+    if ok is None and evaluation.verdict_label == "judge_parsing_error":
+        logger.error(
+            "Notebook judge did not return a parseable verdict (verdict_label=%s). reward=0.0.",
+            evaluation.verdict_label,
+        )
+    return _verify_response(
+        body,
+        reward=1.0 if ok is True else 0.0,
+        match=ok is True,
+        comparison_detail=comparison_detail_for_judge(ok, evaluation),
+        reference_merged_output=reference_merged_output,
+        reference_execution_error=reference_execution_error,
+        predicted_execution_error=predicted_execution_error,
+        num_reference_code_cells=num_reference_code_cells,
+        num_predicted_code_cells=num_predicted_code_cells,
+        judge_evaluations=[evaluation],
+    )
+
+
 class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
     config: DataAnalysisNotebookResourcesServerConfig
 
@@ -900,7 +847,9 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         super().model_post_init(context)
         self._semaphore: Semaphore = Semaphore(value=self.config.max_concurrent_executions)
         self._judge_semaphore = asyncio.Semaphore(value=self.config.judge_endpoint_max_concurrency)
-        tpl_path = _resolve_judge_prompt_path(self.config.judge_prompt_template_fpath)
+        tpl_path = Path(self.config.judge_prompt_template_fpath)
+        if not tpl_path.is_absolute():
+            tpl_path = Path(__file__).resolve().parent / tpl_path
         with open(tpl_path, encoding="utf-8") as f:
             self._judge_prompt_template = f.read().strip()
 
@@ -939,9 +888,9 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         max_c = cfg.judge_max_output_chars
         pred_redacted = redact_signature_for_judge(predicted_signature, max_c)
         pred_json = json.dumps(pred_redacted, indent=2, default=str)
-        pred_code_trunc = _truncate_for_judge(predicted_code, max_c * 2)
+        pred_code_trunc = truncate_for_judge(predicted_code, max_c * 2)
 
-        user_prompt = _fill_notebook_judge_prompt(
+        user_prompt = fill_notebook_judge_prompt(
             self._judge_prompt_template,
             task_text=task_text,
             reference_section=reference_section,
@@ -973,7 +922,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             responses_create_params=responses_create_params,
             response=judge_response,
         )
-        text = _last_assistant_output_text(judge_response)
+        text = last_assistant_output_text(judge_response)
         if text is None:
             evaluation.verdict_label = "judge_parsing_error"
             return None, evaluation
@@ -1032,19 +981,12 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         max_c = self.config.judge_max_output_chars
 
         if skip_exec:
-            log_dir = meta.execution_log_directory or self.config.execution_log_directory
-            if (log_dir or "").strip() == "":
-                log_dir = None
-            log_stem = _resolve_execution_log_stem(
-                meta.execution_log_stem,
+            ref_log_path, pred_log_path, log_task = _setup_execution_logging(
+                meta,
                 body.responses_create_params,
-                meta.data_paths,
-                meta.reference_notebook,
+                self.config,
+                task_excerpt_if_pred_log=True,
             )
-            ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, log_stem)
-            log_task = _task_question_excerpt_for_log(body.responses_create_params) if (
-                ref_log_path or pred_log_path
-            ) else None
             _write_skip_mode_execution_logs(
                 ref_log_path,
                 pred_log_path,
@@ -1053,13 +995,12 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 pred_sources,
                 image_mode,
             )
-            task_text = _inputs_to_task_text(body.responses_create_params)
-            predicted_code_block = "\n\n---\n\n".join(pred_sources)
+            task_text, predicted_code_block = _judge_inputs_from_verify(body.responses_create_params, pred_sources)
             joined_ref = "\n\n---\n\n".join(ref_sources)
             reference_section = (
                 "(Ground-truth reference code only; notebooks were not executed. "
                 "No runtime outputs. The predicted execution block below is empty. "
-                "Decide PASS/FAIL from the task and code alone.)\n\n" + _truncate_for_judge(joined_ref, max_c * 2)
+                "Decide PASS/FAIL from the task and code alone.)\n\n" + truncate_for_judge(joined_ref, max_c * 2)
             )
             sig_pred = merged_output_signature(_notebook_from_code_sources(pred_sources), image_mode)
             ok, evaluation = await self._run_llm_judge(
@@ -1068,38 +1009,20 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 predicted_code=predicted_code_block,
                 predicted_signature=sig_pred,
             )
-            reward = 1.0 if ok is True else 0.0
-            match = ok is True
-            comparison_detail = _comparison_detail_for_judge(ok, evaluation)
-            if ok is None and evaluation.verdict_label == "judge_parsing_error":
-                logger.error(
-                    "Notebook judge did not return a parseable verdict (verdict_label=%s). reward=0.0.",
-                    evaluation.verdict_label,
-                )
-            return _verify_response(
+            return _finalize_judge_verification(
                 body,
-                reward=reward,
-                match=match,
-                comparison_detail=comparison_detail,
-                reference_merged_output=None,
-                reference_execution_error=None,
-                predicted_execution_error=None,
+                ok,
+                evaluation,
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),
-                judge_evaluations=[evaluation],
             )
 
-        log_dir = meta.execution_log_directory or self.config.execution_log_directory
-        if (log_dir or "").strip() == "":
-            log_dir = None
-        log_stem = _resolve_execution_log_stem(
-            meta.execution_log_stem,
+        ref_log_path, pred_log_path, log_task = _setup_execution_logging(
+            meta,
             body.responses_create_params,
-            meta.data_paths,
-            meta.reference_notebook,
+            self.config,
+            task_excerpt_if_pred_log=False,
         )
-        ref_log_path, pred_log_path = _prepare_execution_log_paths(log_dir, log_stem)
-        log_task = _task_question_excerpt_for_log(body.responses_create_params) if ref_log_path else None
 
         def _execute_staged(sources: list[str], log_p: Optional[Path]) -> tuple[Optional[NotebookNode], Optional[str]]:
             return _run_staging_and_execute(
@@ -1122,7 +1045,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             sig_ref = merged_output_signature(ref_nb, image_mode)
 
         if pred_err:
-            pred_exc = pred_err[:_REFERENCE_EXEC_ERR_MAX_CHARS]
+            pred_exc = _truncate_exec_error(pred_err)
             return _verify_response(
                 body,
                 reward=0.0,
@@ -1131,19 +1054,18 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 reference_merged_output=sig_ref,
                 num_reference_code_cells=len(ref_sources),
                 num_predicted_code_cells=len(pred_sources),
-                reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS] if ref_err else None,
+                reference_execution_error=_truncate_exec_error(ref_err),
             )
 
         assert pred_nb is not None
         sig_pred = merged_output_signature(pred_nb, image_mode)
 
-        task_text = _inputs_to_task_text(body.responses_create_params)
-        predicted_code_block = "\n\n---\n\n".join(pred_sources)
+        task_text, predicted_code_block = _judge_inputs_from_verify(body.responses_create_params, pred_sources)
 
         if ref_err:
             reference_section = (
                 "(Reference notebook did not execute successfully; no reference output to compare.)\n"
-                f"Error:\n{ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS]}"
+                f"Error:\n{_truncate_exec_error(ref_err)}"
             )
         else:
             assert sig_ref is not None
@@ -1156,26 +1078,14 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             predicted_signature=sig_pred,
         )
 
-        reward = 1.0 if ok is True else 0.0
-        match = ok is True
-        comparison_detail = _comparison_detail_for_judge(ok, evaluation)
-        if ok is None and evaluation.verdict_label == "judge_parsing_error":
-            logger.error(
-                "Notebook judge did not return a parseable verdict (verdict_label=%s). reward=0.0.",
-                evaluation.verdict_label,
-            )
-
-        return _verify_response(
+        return _finalize_judge_verification(
             body,
-            reward=reward,
-            match=match,
-            comparison_detail=comparison_detail,
+            ok,
+            evaluation,
             reference_merged_output=sig_ref,
-            reference_execution_error=ref_err[:_REFERENCE_EXEC_ERR_MAX_CHARS] if ref_err else None,
-            predicted_execution_error=None,
+            reference_execution_error=_truncate_exec_error(ref_err),
             num_reference_code_cells=len(ref_sources),
             num_predicted_code_cells=len(pred_sources),
-            judge_evaluations=[evaluation],
         )
 
 
