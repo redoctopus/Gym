@@ -25,17 +25,19 @@ from app import (
     DataAnalysisNotebookResourcesServerConfig,
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
+    ReferenceCell,
     _first_line_excerpt_for_log,
-    _notebook_from_code_sources,
     _previous_output_excerpt,
     _resolve_execution_log_stem,
     _task_question_excerpt_for_log,
+    build_notebook_execution_view,
+    build_predicted_execution_view,
     extract_predicted_code_cells,
+    extract_reference_cells,
     extract_reference_code_sources,
-    merged_output_signature,
 )
 from fastapi.testclient import TestClient
-from judge import parse_notebook_judge_verdict, redact_signature_for_judge
+from judge import parse_notebook_judge_verdict, redact_execution_for_judge
 from nbformat.v4 import new_output
 from pydantic import ValidationError
 
@@ -118,6 +120,17 @@ def _ref_nb(*sources: str) -> dict:
     }
 
 
+def _code_output_text(view: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for cell in view.get("cells") or []:
+        if cell.get("cell_type") != "code":
+            continue
+        for rec in cell.get("outputs") or []:
+            if rec.get("kind") in ("stream", "plain"):
+                parts.append(str(rec.get("text") or ""))
+    return "\n".join(parts)
+
+
 def _assistant_response(text: str) -> NeMoGymResponse:
     return NeMoGymResponse(
         id="r1",
@@ -173,7 +186,7 @@ class TestExtract:
         cells = extract_predicted_code_cells(src)
         assert cells == ["print(1)", "print(2)"]
 
-    def test_reference_skips_markdown(self) -> None:
+    def test_reference_cells_include_markdown(self) -> None:
         nb = {
             "nbformat": 4,
             "nbformat_minor": 5,
@@ -183,11 +196,15 @@ class TestExtract:
                 {"cell_type": "code", "metadata": {}, "outputs": [], "source": "print(99)"},
             ],
         }
+        cells = extract_reference_cells(nb)
+        assert len(cells) == 2
+        assert cells[0].cell_type == "markdown"
+        assert cells[1].cell_type == "code"
         assert extract_reference_code_sources(nb) == ["print(99)"]
 
 
-class TestMergedSignature:
-    def test_two_cells_same_stdout_as_one_cell(self) -> None:
+class TestNotebookExecutionView:
+    def test_two_code_cells_stay_separate(self) -> None:
         nb_split = nbformat.v4.new_notebook()
         c1 = nbformat.v4.new_code_cell("x")
         c1.outputs = [new_output("stream", name="stdout", text="1\n")]
@@ -195,16 +212,26 @@ class TestMergedSignature:
         c2.outputs = [new_output("stream", name="stdout", text="2\n")]
         nb_split.cells = [c1, c2]
 
-        nb_one = nbformat.v4.new_notebook()
-        c0 = nbformat.v4.new_code_cell("z")
-        c0.outputs = [new_output("stream", name="stdout", text="1\n2\n")]
-        nb_one.cells = [c0]
+        cells = [ReferenceCell("code", "x"), ReferenceCell("code", "y")]
+        view = build_notebook_execution_view(cells, nb_split, "exact")
+        assert len(view["cells"]) == 2
+        assert view["cells"][0]["outputs"][0]["text"] == "1"
+        assert view["cells"][1]["outputs"][0]["text"] == "2"
 
-        a = merged_output_signature(nb_split, "exact")
-        b = merged_output_signature(nb_one, "exact")
-        assert a == b
+    def test_markdown_cells_preserved_in_view(self) -> None:
+        cells = [
+            ReferenceCell("markdown", "# Title"),
+            ReferenceCell("code", "print(1)"),
+        ]
+        nb = nbformat.v4.new_notebook()
+        c = nbformat.v4.new_code_cell("print(1)")
+        c.outputs = [new_output("stream", name="stdout", text="1\n")]
+        nb.cells = [c]
+        view = build_notebook_execution_view(cells, nb, "exact")
+        assert view["cells"][0]["cell_type"] == "markdown"
+        assert view["cells"][1]["outputs"][0]["text"] == "1"
 
-    def test_stderr_separate_from_stdout(self) -> None:
+    def test_stderr_and_stdout_are_separate_output_records(self) -> None:
         nb = nbformat.v4.new_notebook()
         c = nbformat.v4.new_code_cell("x")
         c.outputs = [
@@ -212,11 +239,14 @@ class TestMergedSignature:
             new_output("stream", name="stderr", text="b\n"),
         ]
         nb.cells = [c]
-        sig = merged_output_signature(nb, "exact")
-        assert sig["text_merged"] == "a"
-        assert sig["stderr_merged"] == "b"
+        view = build_predicted_execution_view(["x"], nb, "exact")
+        outputs = view["cells"][0]["outputs"]
+        assert outputs[0]["name"] == "stdout"
+        assert outputs[0]["text"] == "a"
+        assert outputs[1]["name"] == "stderr"
+        assert outputs[1]["text"] == "b"
 
-    def test_stdout_and_plain_interleaved_in_text_merged(self) -> None:
+    def test_stdout_and_plain_stay_separate_output_records(self) -> None:
         nb = nbformat.v4.new_notebook()
         c = nbformat.v4.new_code_cell("x")
         c.outputs = [
@@ -229,16 +259,15 @@ class TestMergedSignature:
             },
         ]
         nb.cells = [c]
-        sig = merged_output_signature(nb, "exact")
-        assert sig["text_merged"] == "printed\nrepr_value"
+        view = build_predicted_execution_view(["x"], nb, "exact")
+        outputs = view["cells"][0]["outputs"]
+        assert outputs[0]["kind"] == "stream"
+        assert outputs[1]["kind"] == "plain"
+        assert outputs[1]["text"] == "repr_value"
 
-    def test_notebook_from_code_sources_empty_merged_signature(self) -> None:
-        nb = _notebook_from_code_sources(["print(1)", "x = 2"])
-        sig = merged_output_signature(nb, "exact")
-        assert sig["text_merged"] == ""
-        assert sig["stderr_merged"] == ""
-        assert sig["pngs"] == []
-        assert sig["errors"] == []
+    def test_skip_mode_empty_outputs(self) -> None:
+        view = build_predicted_execution_view(["print(1)", "x = 2"], None, "exact")
+        assert all(cell["outputs"] == [] for cell in view["cells"])
 
     def test_previous_output_excerpt_trailing_lines(self) -> None:
         nb = nbformat.v4.new_notebook()
@@ -287,12 +316,25 @@ class TestParseJudgeVerdict:
         assert ok is None and label == "judge_parsing_error"
 
 
-class TestRedactSignatureForJudge:
+class TestRedactExecutionForJudge:
     def test_pngs_become_summary(self) -> None:
-        sig = {"text_merged": "a", "stderr_merged": "", "pngs": ["aaa", "bbb"], "errors": []}
-        out = redact_signature_for_judge(sig, 1000)
+        view = {
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "source": "x",
+                    "outputs": [
+                        {"kind": "plain", "text": "a"},
+                        {"kind": "png", "data": "aaa"},
+                        {"kind": "png", "data": "bbb"},
+                    ],
+                }
+            ]
+        }
+        out = redact_execution_for_judge(view, 1000)
         assert "2 PNG figure" in out["png_summary"]
-        assert "pngs" not in out
+        outputs = out["cells"][0]["outputs"]
+        assert all(rec.get("kind") != "png" or rec.get("omitted") for rec in outputs)
 
 
 class TestExecutionLogStem:
@@ -358,8 +400,8 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert res.reference_merged_output is not None
-        assert "hello" in res.reference_merged_output["text_merged"]
+        assert res.reference_execution_output is not None
+        assert "hello" in _code_output_text(res.reference_execution_output)
         assert res.judge_evaluations is not None
         assert res.judge_evaluations[0].verdict_label == "pass"
 
@@ -374,7 +416,7 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert "reference" in res.reference_merged_output["text_merged"]
+        assert "reference" in _code_output_text(res.reference_execution_output)
 
     async def test_verify_fail_different_output(self, client_judge_fail: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -386,8 +428,8 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.match is False
-        assert res.reference_merged_output is not None
-        assert "right" in res.reference_merged_output["text_merged"]
+        assert res.reference_execution_output is not None
+        assert "right" in _code_output_text(res.reference_execution_output)
 
     async def test_verify_fail_no_python_fence(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -410,8 +452,8 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.predicted_execution_error
-        assert res.reference_merged_output is not None
-        assert res.reference_merged_output["text_merged"] == "1"
+        assert res.reference_execution_output is not None
+        assert _code_output_text(res.reference_execution_output) == "1"
 
     async def test_verify_with_data_paths(self, client_judge_pass: TestClient) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
@@ -483,16 +525,16 @@ class TestVerifyIntegration:
         out_ref = ref_log.read_text(encoding="utf-8")
         out_pred = pred_log.read_text(encoding="utf-8")
         assert "smoke_log_marker" in out_ref and "smoke_log_marker" in out_pred
-        assert "Output (this cell only" in out_ref
+        assert "Outputs (this cell only" in out_ref
         assert "# Task question" in out_ref
         assert "Print hello" in out_ref
         assert "# Task question" in out_pred
 
     async def test_verify_skip_execution_does_not_call_runner(self) -> None:
         def _fail_run(*_a: Any, **_k: Any) -> None:
-            raise AssertionError("_run_staging_and_execute must not run when skip_notebook_execution")
+            raise AssertionError("run_staging_and_execute must not run when skip_notebook_execution")
 
-        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+        with patch("app.run_staging_and_execute", side_effect=_fail_run):
             with _make_test_client("VERDICT: PASS\nREASON: ok") as client:
                 body = DataAnalysisNotebookVerifyRequest(
                     responses_create_params={
@@ -510,7 +552,7 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert res.reference_merged_output is None
+        assert res.reference_execution_output is None
         assert res.reference_execution_error is None
         assert res.predicted_execution_error is None
 
@@ -519,9 +561,9 @@ class TestVerifyIntegration:
         log_dir.mkdir()
 
         def _fail_run(*_a: Any, **_k: Any) -> None:
-            raise AssertionError("_run_staging_and_execute must not run when skip_notebook_execution")
+            raise AssertionError("run_staging_and_execute must not run when skip_notebook_execution")
 
-        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+        with patch("app.run_staging_and_execute", side_effect=_fail_run):
             mock = _stub_server_client()
             _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
             server = DataAnalysisNotebookResourcesServer(
@@ -566,7 +608,7 @@ class TestVerifyIntegration:
         def _fail_run(*_a: Any, **_k: Any) -> None:
             raise AssertionError("no execution")
 
-        with patch("app._run_staging_and_execute", side_effect=_fail_run):
+        with patch("app.run_staging_and_execute", side_effect=_fail_run):
             with _make_test_client("VERDICT: PASS\nREASON: ok") as client:
                 body = DataAnalysisNotebookVerifyRequest(
                     responses_create_params={
@@ -594,6 +636,7 @@ class TestVerifyIntegration:
             margin: int,
             log_path: Any = None,
             log_task_excerpt: Any = None,
+            log_cell_specs: Any = None,
         ) -> tuple[Any, None]:
             nonlocal calls
             calls += 1
@@ -609,7 +652,7 @@ class TestVerifyIntegration:
             config=_default_dan_config(skip_notebook_execution=True),
             server_client=mock,
         )
-        with patch("app._run_staging_and_execute", side_effect=fake_run):
+        with patch("app.run_staging_and_execute", side_effect=fake_run):
             with TestClient(server.setup_webserver()) as client:
                 body = DataAnalysisNotebookVerifyRequest(
                     responses_create_params={

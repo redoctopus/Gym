@@ -3,9 +3,9 @@ You evaluate whether a candidate Python notebook solution completes the user's d
 You are given:
 1) The TASK (instructions shown to the model).
 2) Optional REFERENCE execution output from a ground-truth notebook run on the same staged data. Use it to check numeric/table conclusions when relevant. If reference output is missing because the reference run failed, judge only whether the predicted solution satisfies the task.
-   Sometimes REFERENCE is only ground-truth **source code** (no execution): the preamble will say notebooks were not executed. In that mode there are no runtime outputs to compare; judge PASS/FAIL from the task, reference source, and predicted code only. Do not require numeric agreement with outputs that do not exist.
+   Sometimes REFERENCE is only ground-truth **source** (no execution): the preamble will say notebooks were not executed. In that mode there are no runtime outputs to compare; judge PASS/FAIL from the task, reference cells (code and markdown), and predicted code only. Do not require numeric agreement with outputs that do not exist.
 3) The PREDICTED source code (extracted code cells).
-4) The PREDICTED merged execution output (stdout, stderr, text/plain displays). PNG/chart pixel data are omitted; only counts are shown—do not require pixel-identical charts.
+4) The PREDICTED per-cell execution output (stdout, stderr, text/plain displays per code cell). PNG/chart pixel data are omitted; only counts are shown—do not require pixel-identical charts.
    When execution was skipped, this block is empty or trivial (no real run occurred); rely on the task and code in that case.
 
 Rules:
@@ -36,5 +36,5 @@ REASON: <one short sentence>
 {predicted_code}
 
 ---
-## PREDICTED EXECUTION (merged, text; PNG omitted)
-{predicted_signature_json}
+## PREDICTED EXECUTION (per cell, text; PNG omitted)
+{predicted_execution_json}

@@ -40,7 +40,7 @@ class NotebookJudgeEvaluation(BaseModel):
     reason: Optional[str] = None
 
 
-def _message_content_to_text(content: Any) -> str:
+def message_content_to_text(content: Any) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -62,29 +62,62 @@ def truncate_for_judge(s: str, max_chars: int) -> str:
     return s[: max_chars - 20] + "\n...[truncated]...\n"
 
 
-def redact_signature_for_judge(sig: dict[str, Any], max_chars_per_field: int) -> dict[str, Any]:
-    """Drop PNG payloads; truncate text fields for the judge prompt."""
-    pngs = sig.get("pngs") or []
-    png_note = f"{len(pngs)} PNG figure(s); pixel data omitted."
-    errors = sig.get("errors") or []
-    err_out: list[dict[str, Any]] = []
-    for e in errors[:50]:
-        tb = e.get("traceback") or []
+def _redact_output_record(rec: dict[str, Any], max_chars_per_field: int) -> dict[str, Any]:
+    kind = rec.get("kind")
+    if kind == "stream":
+        return {
+            "kind": "stream",
+            "name": rec.get("name", "stdout"),
+            "text": truncate_for_judge(str(rec.get("text") or ""), max_chars_per_field),
+        }
+    if kind == "plain":
+        return {"kind": "plain", "text": truncate_for_judge(str(rec.get("text") or ""), max_chars_per_field)}
+    if kind == "png":
+        return {"kind": "png", "omitted": True}
+    if kind == "error":
+        tb = rec.get("traceback") or []
         if isinstance(tb, list) and len(tb) > 30:
             tb = tb[-30:]
-        err_out.append(
-            {
-                "ename": e.get("ename", ""),
-                "evalue": truncate_for_judge(str(e.get("evalue", "")), max_chars_per_field),
-                "traceback": tb,
-            }
-        )
-    return {
-        "text_merged": truncate_for_judge(str(sig.get("text_merged") or ""), max_chars_per_field),
-        "stderr_merged": truncate_for_judge(str(sig.get("stderr_merged") or ""), max_chars_per_field),
-        "png_summary": png_note,
-        "errors": err_out,
-    }
+        return {
+            "kind": "error",
+            "ename": rec.get("ename", ""),
+            "evalue": truncate_for_judge(str(rec.get("evalue", "")), max_chars_per_field),
+            "traceback": tb,
+        }
+    return dict(rec)
+
+
+def redact_execution_for_judge(view: dict[str, Any], max_chars_per_field: int) -> dict[str, Any]:
+    """Drop PNG payloads; truncate text fields for the judge prompt."""
+    cells_out: list[dict[str, Any]] = []
+    total_pngs = 0
+    for cell in view.get("cells") or []:
+        ctype = cell.get("cell_type")
+        if ctype == "markdown":
+            cells_out.append(
+                {
+                    "cell_type": "markdown",
+                    "source": truncate_for_judge(str(cell.get("source") or ""), max_chars_per_field),
+                }
+            )
+            continue
+        if ctype != "code":
+            continue
+        outputs_out = [_redact_output_record(rec, max_chars_per_field) for rec in (cell.get("outputs") or [])]
+        cell_pngs = sum(1 for rec in outputs_out if rec.get("kind") == "png")
+        total_pngs += cell_pngs
+        code_cell: dict[str, Any] = {
+            "cell_type": "code",
+            "source": truncate_for_judge(str(cell.get("source") or ""), max_chars_per_field),
+            "outputs": outputs_out,
+        }
+        if cell_pngs:
+            code_cell["png_count"] = cell_pngs
+        cells_out.append(code_cell)
+    result: dict[str, Any] = {"cells": cells_out}
+    if total_pngs:
+        result["png_summary"] = f"{total_pngs} PNG figure(s) across cells; pixel data omitted."
+    return result
 
 
 def parse_notebook_judge_verdict(text: str) -> tuple[Optional[bool], Optional[str], Optional[str]]:
@@ -108,7 +141,7 @@ def inputs_to_task_text(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
         if getattr(m, "type", None) != "message":
             continue
         role = getattr(m, "role", None)
-        raw = _message_content_to_text(getattr(m, "content", None))
+        raw = message_content_to_text(getattr(m, "content", None))
         if raw:
             lines.append(f"{role}:\n{raw}")
     return "\n\n".join(lines).strip() or "(empty task)"
@@ -131,15 +164,14 @@ def fill_notebook_judge_prompt(
     task_text: str,
     reference_section: str,
     predicted_code: str,
-    predicted_signature_json: str,
+    predicted_execution_json: str,
 ) -> str:
-    replacements = {
-        "{task_text}": task_text,
-        "{reference_section}": reference_section,
-        "{predicted_code}": predicted_code,
-        "{predicted_signature_json}": predicted_signature_json,
-    }
-    for key, value in replacements.items():
+    for key, value in (
+        ("{task_text}", task_text),
+        ("{reference_section}", reference_section),
+        ("{predicted_code}", predicted_code),
+        ("{predicted_execution_json}", predicted_execution_json),
+    ):
         template = template.replace(key, value)
     return template
 
