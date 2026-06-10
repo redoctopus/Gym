@@ -9,7 +9,7 @@ You are given:
    When execution was skipped, this block is empty or trivial (no real run occurred); rely on the task and code in that case.
 
 Rules:
-- PASS if the predicted code runs without fatal notebook errors and the outputs satisfy the task. Semantic equivalence matters: different rounding, ordering of prints, or formatting is OK if conclusions match where applicable.
+- PASS if the predicted code runs without fatal notebook errors and the outputs satisfy the task. Semantic equivalence matters: different rounding, ordering of prints, or formatting is OK if conclusions match where applicable. Number of cells in the reference and predicted code do not need to match.
 - When reference **execution** output is present, predicted key numbers/conclusions should agree with the reference unless the task allows multiple valid answers.
 - When only reference **source** was provided (no execution), do not demand output agreement; judge whether the predicted code plausibly fulfills the task and aligns with the reference approach where applicable.
 - FAIL if the task is incomplete, wrong, or contradicts the reference in ways that matter for the task.

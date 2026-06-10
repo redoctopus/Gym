@@ -127,7 +127,7 @@ def parse_notebook_judge_verdict(text: str) -> tuple[Optional[bool], Optional[st
     reason_m = _JUDGE_REASON_RE.search(text)
     reason = reason_m.group(1).strip() if reason_m else None
     if has_pass == has_fail:
-        return None, "judge_parsing_error", reason
+        return None, "judge_parsing_error", text
     return (True, "pass", reason) if has_pass else (False, "fail", reason)
 
 
@@ -156,24 +156,6 @@ def last_assistant_output_text(resp: NeMoGymResponse) -> Optional[str]:
         return getattr(last_content, "text", "") or ""
     except Exception:
         return None
-
-
-def fill_notebook_judge_prompt(
-    template: str,
-    *,
-    task_text: str,
-    reference_section: str,
-    predicted_code: str,
-    predicted_execution_json: str,
-) -> str:
-    for key, value in (
-        ("{task_text}", task_text),
-        ("{reference_section}", reference_section),
-        ("{predicted_code}", predicted_code),
-        ("{predicted_execution_json}", predicted_execution_json),
-    ):
-        template = template.replace(key, value)
-    return template
 
 
 def comparison_detail_for_judge(ok: Optional[bool], evaluation: NotebookJudgeEvaluation) -> str:

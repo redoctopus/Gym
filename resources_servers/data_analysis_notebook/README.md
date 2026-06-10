@@ -8,7 +8,7 @@ If the reference notebook fails to execute, verification still runs for the pred
 
 **Charts / images:** PNG pixel data is **not** sent to the judge (only how many figures were produced per cell). Pixel-level chart equivalence would require a separate vision-capable judge.
 
-Reference notebooks preserve **markdown** and **code** cells in order. Only code cells are executed; markdown cells appear in reference logs, judge input, and `reference_execution_output`.
+Reference notebooks preserve **markdown** and **code** cells in order. Only code cells are executed; markdown cells appear in judge input.
 
 ## Security
 
@@ -23,8 +23,6 @@ Each line includes:
   - `reference_notebook` (object): full nbformat v4 notebook JSON. Code and markdown cells are preserved in order; only code cells are run (or only their sources are sent to the judge when execution is skipped).
   - `skip_notebook_execution` (optional): if `true` or `false`, overrides the resources server config `skip_notebook_execution` for that `/verify` call.
   - `data_paths` (optional): list of `{"source": "/path/on/server/or/relative", "path": "relative/path/in/sandbox"}` entries; each `source` file or directory is copied into the sandbox at `path` before execution (same layout for reference and predicted runs). Paths are resolved on the machine running the resources server.
-  - `execution_log_directory` (optional, server path): if set, overrides the resources server config field of the same name. When a log directory is active (config and/or this field), each `/verify` writes two append-only files directly in that directory: `<YYYY-mm-dd_HH-MM-SS_ffffff>_{stem}_reference.log` and the same prefix with `_predicted.log` (local time, microsecond resolution in the prefix). Unless `execution_log_stem` is set to a valid single path component, `stem` is derived from the first line of the task (last user message), then the first `data_paths` filename, then the reference notebook’s `metadata.title` if needed; the stem is sanitized and length-capped. If nothing usable remains, a random id is used. On the rare case that those paths already exist, an extra short random segment is inserted after the timestamp. The top of each file includes a **Task question** line: the first line of the last `user` message in `responses_create_params.input` (or the first line of `input` if it is a string), truncated to a max character count. After each cell, the log records that cell’s source and **only that cell’s** structured outputs (not merged across prior cells), then flushes—so a wall-clock kill can still show completed cells without repeated earlier output. Reference logs include markdown cells in notebook order; predicted logs are code-only. Treat paths like `data_paths`: the dataset/operator is trusted. Very large cell output can produce large log files; source and JSON are truncated in the log beyond fixed limits.
-  - `execution_log_stem` (optional): if set to a single safe path component (no `/` or `\\`), used as the `{stem}` part of the filenames after sanitization and length capping; otherwise ignored and the automatic stem above applies.
 
 Top-level fields are forwarded to `/verify` by `simple_agent` (`extra="allow"`).
 
@@ -44,12 +42,12 @@ Thinking wrappers (`</think>`, `<thinking>...</thinking>`) are removed before pa
 
 ## Configuration
 
-See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): `skip_notebook_execution` (default `false`), execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), `image_compare_mode` (`exact` | `none`) for PNG inclusion in per-cell output records, optional `execution_log_directory`, and **judge** settings:
+See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): `skip_notebook_execution` (default `false`), execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), `image_compare_mode` (`exact` | `none`) for PNG inclusion in per-cell output records, and **judge** settings:
 
 - `judge_model_server` — second `responses_api_models` instance (default YAML uses OpenAI-compatible `gpt-4o-mini` via `notebook_judge_model`).
 - `judge_responses_create_params` — `max_output_tokens` large enough for `VERDICT:` + optional `REASON:`.
 - `judge_prompt_template_fpath` — rubric template under `prompt_templates/`.
-- `judge_max_output_chars` — per-field truncation for reference/predicted text sent to the judge.
+- `judge_max_output_chars` — character limit passed to `truncate_for_judge` for judge prompt text (default `12000`). Applies uniformly to the **PREDICTED CODE** block and to each text field inside the reference/predicted execution JSON (cell sources, stream/plain text, errors). PNG payloads are omitted regardless. This is **not** a total prompt cap: many cells can each contribute up to the limit, and the **TASK** section is not truncated. Long values are cut with a `...[truncated]...` marker.
 - `judge_probe_on_startup` — wait until the judge `/v1/responses` endpoint is reachable at startup (set `false` in tests).
 
 Composite runs must include **both** the resources server config and the judge model server config, for example:
@@ -60,7 +58,7 @@ ng_run "+config_paths=[resources_servers/data_analysis_notebook/configs/data_ana
 
 (`env.yaml` should define `policy_base_url`, `policy_api_key`, and optionally override model names.)
 
-The verify response may include `reference_execution_output` (per-cell reference view), and `judge_evaluations` with the judge call and parsed `verdict_label` (`pass`, `fail`, `judge_error`, `judge_parsing_error`).
+The verify response includes `judge_evaluations` with the judge call and parsed `verdict_label` (`pass`, `fail`, `judge_error`, `judge_parsing_error`).
 
 ## Dependencies
 

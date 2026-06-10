@@ -25,20 +25,12 @@ from app import (
     DataAnalysisNotebookResourcesServerConfig,
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
-    ReferenceCell,
-    _first_line_excerpt_for_log,
-    _previous_output_excerpt,
-    _resolve_execution_log_stem,
-    _task_question_excerpt_for_log,
-    build_notebook_execution_view,
-    build_predicted_execution_view,
-    extract_predicted_code_cells,
-    extract_reference_cells,
-    extract_reference_code_sources,
+    extract_predicted_notebook,
 )
 from fastapi.testclient import TestClient
 from judge import parse_notebook_judge_verdict, redact_execution_for_judge
 from nbformat.v4 import new_output
+from notebook_runtime import build_notebook_execution_view
 from pydantic import ValidationError
 
 from nemo_gym.config_types import ModelServerRef
@@ -120,15 +112,15 @@ def _ref_nb(*sources: str) -> dict:
     }
 
 
-def _code_output_text(view: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for cell in view.get("cells") or []:
-        if cell.get("cell_type") != "code":
-            continue
-        for rec in cell.get("outputs") or []:
-            if rec.get("kind") in ("stream", "plain"):
-                parts.append(str(rec.get("text") or ""))
-    return "\n".join(parts)
+def _code_notebook(*sources: str) -> nbformat.NotebookNode:
+    nb = nbformat.v4.new_notebook()
+    nb.cells = [nbformat.v4.new_code_cell(source) for source in sources]
+    return nb
+
+
+def _predicted_code_sources(text: str) -> list[str]:
+    nb = extract_predicted_notebook(text)
+    return [cell.source for cell in nb.cells if cell.cell_type == "code"]
 
 
 def _assistant_response(text: str) -> NeMoGymResponse:
@@ -152,94 +144,76 @@ def _assistant_response(text: str) -> NeMoGymResponse:
     )
 
 
-class TestTaskQuestionExcerpt:
-    def test_uses_last_user_message(self) -> None:
-        p = NeMoGymResponseCreateParamsNonStreaming(
-            input=[
-                {"type": "message", "role": "user", "content": "early line"},
-                {"type": "message", "role": "user", "content": "what is 2+2?"},
-            ],
-            parallel_tool_calls=False,
-        )
-        assert _task_question_excerpt_for_log(p) == "what is 2+2?"
+class TestExtractPredictedNotebook:
+    def test_empty_text_returns_empty_notebook(self) -> None:
+        nb = extract_predicted_notebook("")
+        assert nb.cells == []
+        nb = extract_predicted_notebook("no fences here")
+        assert nb.cells == []
 
-    def test_str_input_first_line_only(self) -> None:
-        p = NeMoGymResponseCreateParamsNonStreaming(
-            input="line a\nline b",
-            parallel_tool_calls=False,
-        )
-        assert _task_question_excerpt_for_log(p) == "line a"
-
-    def test_first_line_truncation(self) -> None:
-        long = "x" * 600
-        assert _first_line_excerpt_for_log(long).endswith("...")
-        assert len(_first_line_excerpt_for_log(long)) == 500
-
-
-class TestExtract:
-    def test_predicted_empty(self) -> None:
-        assert extract_predicted_code_cells("") == []
-        assert extract_predicted_code_cells("no fences here") == []
-
-    def test_predicted_multiple(self) -> None:
+    def test_multiple_python_fences(self) -> None:
         src = "```python\nprint(1)\n```\n\n```py\nprint(2)\n```"
-        cells = extract_predicted_code_cells(src)
-        assert cells == ["print(1)", "print(2)"]
+        assert _predicted_code_sources(src) == ["print(1)", "print(2)"]
 
-    def test_reference_cells_include_markdown(self) -> None:
-        nb = {
-            "nbformat": 4,
-            "nbformat_minor": 5,
-            "metadata": {},
-            "cells": [
-                {"cell_type": "markdown", "metadata": {}, "source": "# Title"},
-                {"cell_type": "code", "metadata": {}, "outputs": [], "source": "print(99)"},
-            ],
-        }
-        cells = extract_reference_cells(nb)
-        assert len(cells) == 2
-        assert cells[0].cell_type == "markdown"
-        assert cells[1].cell_type == "code"
-        assert extract_reference_code_sources(nb) == ["print(99)"]
+    def test_markdown_and_code_in_order(self) -> None:
+        src = (
+            "```markdown\n# Title\n```\n\n"
+            "```python\nprint(1)\n```\n\n"
+            "```markdown\n## Section\n```\n\n"
+            "```python\nprint(2)\n```"
+        )
+        nb = extract_predicted_notebook(src)
+        assert [cell.cell_type for cell in nb.cells] == ["markdown", "code", "markdown", "code"]
+        assert nb.cells[0].source == "# Title"
+        assert nb.cells[1].source == "print(1)"
+        assert nb.cells[3].source == "print(2)"
+
+    def test_strip_thinking_before_fences(self) -> None:
+        src = "<think>\ninternal\n</think>\n```python\nprint(7)\n```"
+        assert _predicted_code_sources(src) == ["print(7)"]
+
+    def test_unclosed_redacted_thinking_yields_no_cells(self) -> None:
+        src = "<think>\nstill reasoning\n```python\nprint(1)\n```"
+        assert extract_predicted_notebook(src).cells == []
 
 
 class TestNotebookExecutionView:
     def test_two_code_cells_stay_separate(self) -> None:
-        nb_split = nbformat.v4.new_notebook()
+        source_nb = _code_notebook("x", "y")
+        executed_nb = nbformat.v4.new_notebook()
         c1 = nbformat.v4.new_code_cell("x")
         c1.outputs = [new_output("stream", name="stdout", text="1\n")]
         c2 = nbformat.v4.new_code_cell("y")
         c2.outputs = [new_output("stream", name="stdout", text="2\n")]
-        nb_split.cells = [c1, c2]
+        executed_nb.cells = [c1, c2]
 
-        cells = [ReferenceCell("code", "x"), ReferenceCell("code", "y")]
-        view = build_notebook_execution_view(cells, nb_split, "exact")
+        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
         assert len(view["cells"]) == 2
         assert view["cells"][0]["outputs"][0]["text"] == "1"
         assert view["cells"][1]["outputs"][0]["text"] == "2"
 
     def test_markdown_cells_preserved_in_view(self) -> None:
-        cells = [
-            ReferenceCell("markdown", "# Title"),
-            ReferenceCell("code", "print(1)"),
-        ]
-        nb = nbformat.v4.new_notebook()
-        c = nbformat.v4.new_code_cell("print(1)")
-        c.outputs = [new_output("stream", name="stdout", text="1\n")]
-        nb.cells = [c]
-        view = build_notebook_execution_view(cells, nb, "exact")
+        source_nb = nbformat.v4.new_notebook()
+        source_nb.cells = [nbformat.v4.new_markdown_cell("# Title"), nbformat.v4.new_code_cell("print(1)")]
+        executed_nb = nbformat.v4.new_notebook()
+        executed_code = nbformat.v4.new_code_cell("print(1)")
+        executed_code.outputs = [new_output("stream", name="stdout", text="1\n")]
+        executed_nb.cells = [nbformat.v4.new_markdown_cell("# Title"), executed_code]
+
+        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
         assert view["cells"][0]["cell_type"] == "markdown"
         assert view["cells"][1]["outputs"][0]["text"] == "1"
 
     def test_stderr_and_stdout_are_separate_output_records(self) -> None:
-        nb = nbformat.v4.new_notebook()
+        source_nb = _code_notebook("x")
+        executed_nb = nbformat.v4.new_notebook()
         c = nbformat.v4.new_code_cell("x")
         c.outputs = [
             new_output("stream", name="stdout", text="a\n"),
             new_output("stream", name="stderr", text="b\n"),
         ]
-        nb.cells = [c]
-        view = build_predicted_execution_view(["x"], nb, "exact")
+        executed_nb.cells = [c]
+        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
         outputs = view["cells"][0]["outputs"]
         assert outputs[0]["name"] == "stdout"
         assert outputs[0]["text"] == "a"
@@ -247,7 +221,8 @@ class TestNotebookExecutionView:
         assert outputs[1]["text"] == "b"
 
     def test_stdout_and_plain_stay_separate_output_records(self) -> None:
-        nb = nbformat.v4.new_notebook()
+        source_nb = _code_notebook("x")
+        executed_nb = nbformat.v4.new_notebook()
         c = nbformat.v4.new_code_cell("x")
         c.outputs = [
             new_output("stream", name="stdout", text="printed\n"),
@@ -258,32 +233,16 @@ class TestNotebookExecutionView:
                 "execution_count": 1,
             },
         ]
-        nb.cells = [c]
-        view = build_predicted_execution_view(["x"], nb, "exact")
+        executed_nb.cells = [c]
+        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
         outputs = view["cells"][0]["outputs"]
         assert outputs[0]["kind"] == "stream"
         assert outputs[1]["kind"] == "plain"
         assert outputs[1]["text"] == "repr_value"
 
     def test_skip_mode_empty_outputs(self) -> None:
-        view = build_predicted_execution_view(["print(1)", "x = 2"], None, "exact")
+        view = build_notebook_execution_view(_code_notebook("print(1)", "x = 2"), None, "exact")
         assert all(cell["outputs"] == [] for cell in view["cells"])
-
-    def test_previous_output_excerpt_trailing_lines(self) -> None:
-        nb = nbformat.v4.new_notebook()
-        c0 = nbformat.v4.new_code_cell("x")
-        c0.outputs = [new_output("stream", name="stdout", text="line0\n" * 20)]
-        c1 = nbformat.v4.new_code_cell("y")
-        c1.outputs = [new_output("stream", name="stdout", text="last\n")]
-        nb.cells = [c0, c1]
-        out = _previous_output_excerpt(nb, failing_code_cell_index=1, max_lines=3)
-        assert "line0" in out
-        assert out.count("\n") <= 4  # at most 3 data lines + leading "..." line
-
-    def test_previous_output_excerpt_no_prior_cells(self) -> None:
-        nb = nbformat.v4.new_notebook()
-        nb.cells = [nbformat.v4.new_code_cell("x")]
-        assert "no output" in _previous_output_excerpt(nb, 0, 5).lower()
 
 
 @pytest.fixture
@@ -337,54 +296,6 @@ class TestRedactExecutionForJudge:
         assert all(rec.get("kind") != "png" or rec.get("omitted") for rec in outputs)
 
 
-class TestExecutionLogStem:
-    def test_explicit_stem_sanitized(self) -> None:
-        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
-            {"input": [{"type": "message", "role": "user", "content": "ignored"}], "parallel_tool_calls": False}
-        )
-        stem = _resolve_execution_log_stem("  My Run #1  ", params, None, {})
-        assert stem == "My_Run_1"
-
-    def test_derived_from_task_and_data_path(self) -> None:
-        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
-            {
-                "input": [{"type": "message", "role": "user", "content": "Summarize the dataset."}],
-                "parallel_tool_calls": False,
-            }
-        )
-        stem = _resolve_execution_log_stem(
-            None,
-            params,
-            [{"source": "/mnt/d.csv", "path": "custom/subset.csv"}],
-            {},
-        )
-        assert stem.startswith("Summarize_the_dataset")
-        assert "subset.csv" in stem
-
-    def test_invalid_explicit_falls_through_to_task(self) -> None:
-        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
-            {
-                "input": [{"type": "message", "role": "user", "content": "Valid line for stem."}],
-                "parallel_tool_calls": False,
-            }
-        )
-        stem = _resolve_execution_log_stem("../evil", params, None, {})
-        assert "Valid_line_for_stem" in stem
-
-    def test_notebook_title_when_no_user_text(self) -> None:
-        params = NeMoGymResponseCreateParamsNonStreaming.model_validate(
-            {"input": [{"type": "message", "role": "user", "content": "  "}], "parallel_tool_calls": False}
-        )
-        nb = {
-            "metadata": {"title": "Kaggle Starter Notebook"},
-            "nbformat": 4,
-            "nbformat_minor": 5,
-            "cells": [],
-        }
-        stem = _resolve_execution_log_stem(None, params, None, nb)
-        assert "Kaggle_Starter_Notebook" in stem
-
-
 class TestVerifyIntegration:
     async def test_verify_pass_matching_code(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -400,8 +311,6 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert res.reference_execution_output is not None
-        assert "hello" in _code_output_text(res.reference_execution_output)
         assert res.judge_evaluations is not None
         assert res.judge_evaluations[0].verdict_label == "pass"
 
@@ -416,7 +325,6 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert "reference" in _code_output_text(res.reference_execution_output)
 
     async def test_verify_fail_different_output(self, client_judge_fail: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -428,8 +336,6 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.match is False
-        assert res.reference_execution_output is not None
-        assert "right" in _code_output_text(res.reference_execution_output)
 
     async def test_verify_fail_no_python_fence(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -440,7 +346,7 @@ class TestVerifyIntegration:
         r = client_judge_pass.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
-        assert "no python code fences" in res.comparison_detail
+        assert "no python code cells" in res.comparison_detail
 
     async def test_verify_predicted_syntax_error(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
@@ -452,8 +358,7 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 0.0
         assert res.predicted_execution_error
-        assert res.reference_execution_output is not None
-        assert _code_output_text(res.reference_execution_output) == "1"
+        assert res.reference_execution_error is None
 
     async def test_verify_with_data_paths(self, client_judge_pass: TestClient) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
@@ -479,7 +384,7 @@ class TestVerifyIntegration:
         finally:
             Path(src_path).unlink(missing_ok=True)
 
-    async def test_strip_thinking_before_fences(self, client_judge_pass: TestClient) -> None:
+    async def test_strip_thinking_before_fences_integration(self, client_judge_pass: TestClient) -> None:
         body = DataAnalysisNotebookVerifyRequest(
             responses_create_params={"input": [{"role": "user", "content": "x"}], "parallel_tool_calls": False},
             response=_assistant_response(
@@ -490,45 +395,6 @@ class TestVerifyIntegration:
         r = client_judge_pass.post("/verify", json=body.model_dump())
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
-
-    async def test_verify_writes_per_execution_log_files(self, tmp_path: Path) -> None:
-        log_dir = tmp_path / "execution_logs"
-        log_dir.mkdir()
-        mock = _stub_server_client()
-        _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
-        server = DataAnalysisNotebookResourcesServer(
-            config=_default_dan_config(execution_log_directory=str(log_dir)),
-            server_client=mock,
-        )
-        app = server.setup_webserver()
-        with TestClient(app) as client:
-            body = DataAnalysisNotebookVerifyRequest(
-                responses_create_params={
-                    "input": [{"role": "user", "content": "Print hello."}],
-                    "parallel_tool_calls": False,
-                },
-                response=_assistant_response('```python\nprint("smoke_log_marker")\n```'),
-                verifier_metadata={
-                    "reference_notebook": _ref_nb('print("smoke_log_marker")'),
-                    "execution_log_stem": "task_smoke",
-                },
-            )
-            r = client.post("/verify", json=body.model_dump())
-            res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
-        assert r.status_code == 200
-        assert res.reward == 1.0
-        ref_logs = sorted(log_dir.glob("*_task_smoke_reference.log"))
-        pred_logs = sorted(log_dir.glob("*_task_smoke_predicted.log"))
-        assert len(ref_logs) == 1 and len(pred_logs) == 1
-        ref_log, pred_log = ref_logs[0], pred_logs[0]
-        assert ref_log.is_file() and pred_log.is_file()
-        out_ref = ref_log.read_text(encoding="utf-8")
-        out_pred = pred_log.read_text(encoding="utf-8")
-        assert "smoke_log_marker" in out_ref and "smoke_log_marker" in out_pred
-        assert "Outputs (this cell only" in out_ref
-        assert "# Task question" in out_ref
-        assert "Print hello" in out_ref
-        assert "# Task question" in out_pred
 
     async def test_verify_skip_execution_does_not_call_runner(self) -> None:
         def _fail_run(*_a: Any, **_k: Any) -> None:
@@ -552,55 +418,8 @@ class TestVerifyIntegration:
         res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
         assert res.reward == 1.0
         assert res.match is True
-        assert res.reference_execution_output is None
         assert res.reference_execution_error is None
         assert res.predicted_execution_error is None
-
-    async def test_verify_skip_execution_writes_log_files_when_log_dir_set(self, tmp_path: Path) -> None:
-        log_dir = tmp_path / "skip_logs"
-        log_dir.mkdir()
-
-        def _fail_run(*_a: Any, **_k: Any) -> None:
-            raise AssertionError("run_staging_and_execute must not run when skip_notebook_execution")
-
-        with patch("app.run_staging_and_execute", side_effect=_fail_run):
-            mock = _stub_server_client()
-            _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
-            server = DataAnalysisNotebookResourcesServer(
-                config=_default_dan_config(
-                    skip_notebook_execution=True,
-                    execution_log_directory=str(log_dir),
-                ),
-                server_client=mock,
-            )
-            app = server.setup_webserver()
-            with TestClient(app) as client:
-                body = DataAnalysisNotebookVerifyRequest(
-                    responses_create_params={
-                        "input": [{"role": "user", "content": "Skip log stem task."}],
-                        "parallel_tool_calls": False,
-                    },
-                    response=_assistant_response("```python\nprint('pred_skip_marker')\n```"),
-                    verifier_metadata={
-                        "reference_notebook": _ref_nb("print('ref_skip_marker')"),
-                        "execution_log_stem": "skip_log_stem",
-                    },
-                )
-                r = client.post("/verify", json=body.model_dump())
-        assert r.status_code == 200
-        res = DataAnalysisNotebookVerifyResponse.model_validate(r.json())
-        assert res.reward == 1.0
-        ref_logs = sorted(log_dir.glob("*_skip_log_stem_reference.log"))
-        pred_logs = sorted(log_dir.glob("*_skip_log_stem_predicted.log"))
-        assert len(ref_logs) == 1 and len(pred_logs) == 1
-        out_ref = ref_logs[0].read_text(encoding="utf-8")
-        out_pred = pred_logs[0].read_text(encoding="utf-8")
-        assert "skip_notebook_execution" in out_ref and "skip_notebook_execution" in out_pred
-        assert "ref_skip_marker" in out_ref
-        assert "pred_skip_marker" in out_pred
-        assert "not executed (verify skipped notebook execution)" in out_ref
-        assert "# Task question" in out_ref
-        assert "Skip log stem task" in out_ref
 
     async def test_verify_skip_invalid_python_still_calls_judge(self) -> None:
         """Skip mode never executes; invalid syntax is not surfaced as predicted_execution_error."""
@@ -630,21 +449,20 @@ class TestVerifyIntegration:
         calls = 0
 
         def fake_run(
-            sources: list[str],
+            nb: nbformat.NotebookNode,
             data_paths: Any,
             timeout: int,
-            margin: int,
-            log_path: Any = None,
-            log_task_excerpt: Any = None,
-            log_cell_specs: Any = None,
+            wall_margin: int,
+            write_nb: bool = False,
+            notebook_output_fpath: Any = None,
         ) -> tuple[Any, None]:
             nonlocal calls
             calls += 1
-            nb = nbformat.v4.new_notebook()
+            executed = nbformat.v4.new_notebook()
             c = nbformat.v4.new_code_cell("x")
             c.outputs = [new_output("stream", name="stdout", text="ok\n")]
-            nb.cells = [c]
-            return nb, None
+            executed.cells = [c]
+            return executed, None
 
         mock = _stub_server_client()
         _mock_judge_response(mock, "VERDICT: PASS\nREASON: ok")
