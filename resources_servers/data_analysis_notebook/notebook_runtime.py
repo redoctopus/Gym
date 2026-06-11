@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
-import base64
 import multiprocessing
 import os
 import queue
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import nbformat
 from jupyter_client.utils import ensure_async
@@ -65,82 +64,11 @@ def execute_notebook_cells_process(
         return nbformat.reads(payload, as_version=4), None
     return None, str(payload)
 
-_PREVIOUS_OUTPUT_PREVIEW_LINES = 5
 _EXEC_ERR_MAX_CHARS = 5000
-
-def build_notebook_execution_view(
-    nb: NotebookNode,
-    executed_nb: Optional[NotebookNode],
-    image_mode: Literal["exact", "none"],
-) -> dict[str, Any]:
-    """Build a JSON-serializable notebook view for the LLM judge from source cells and execution results.
-
-    Preserves markdown and code cells in order. Attaches canonicalized per-cell outputs from
-    ``executed_nb`` to each code cell (empty when ``executed_nb`` is None). PNG records are
-    omitted when ``image_mode`` is ``"none"``.
-    """
-    cells_out: list[dict[str, Any]] = []
-    executed_cells = list(executed_nb.cells) if executed_nb is not None else []
-
-    if executed_nb is not None:
-        assert len(nb.cells) == len(executed_cells), "Number of cells in reference and executed notebooks must match"
-
-    for i in range(len(nb.cells)):
-        ref_cell = nb.cells[i]
-
-        if ref_cell.cell_type == "markdown":
-            cells_out.append({"cell_type": "markdown", "source": ref_cell.source})
-            continue
-
-        outputs: list[dict[str, Any]] = []
-        if executed_nb is not None:
-            outputs = _canonicalize_cell_outputs(executed_cells[i])
-            if image_mode != "exact":
-                outputs = [rec for rec in outputs if rec.get("kind") != "png"]
-        cells_out.append({"cell_type": "code", "source": ref_cell.source, "outputs": outputs})
-    return {"cells": cells_out}
 
 
 def truncate_exec_error(err: Optional[str]) -> Optional[str]:
     return err[:_EXEC_ERR_MAX_CHARS] if err else None
-
-
-def _normalize_text(s: str) -> str:
-    return "\n".join(line.rstrip() for line in s.replace("\r\n", "\n").strip().split("\n")).strip()
-
-
-def _canonicalize_cell_outputs(cell: NotebookNode) -> list[dict[str, Any]]:
-    """Convert nbformat cell outputs into normalized ``kind`` records for the judge and error excerpts."""
-    records: list[dict[str, Any]] = []
-    for out in cell.get("outputs", []):
-        otype = out.get("output_type")
-        if otype == "stream":
-            text = out.get("text", "")
-            if isinstance(text, list):
-                text = "".join(text)
-            records.append({"kind": "stream", "name": out.get("name", "stdout"), "text": _normalize_text(text)})
-        elif otype == "error":
-            tb = out.get("traceback", [])
-            if isinstance(tb, list):
-                tb = [_normalize_text(str(line)) for line in tb]
-            records.append(
-                {
-                    "kind": "error",
-                    "ename": str(out.get("ename", "")),
-                    "evalue": _normalize_text(str(out.get("evalue", ""))),
-                    "traceback": tb,
-                }
-            )
-        elif otype in ("display_data", "execute_result"):
-            data = dict(out.get("data", {}))
-            plain = data.get("text/plain")
-            if plain is not None:
-                records.append({"kind": "plain", "text": _normalize_text(str(plain))})
-            png = data.get("image/png")
-            if png is not None:
-                png_b64 = png if isinstance(png, str) else base64.b64encode(png).decode("ascii")
-                records.append({"kind": "png", "data": png_b64})
-    return records
 
 
 def _stage_data_paths(target: Path, data_paths: Optional[list[dict[str, str]]]) -> None:

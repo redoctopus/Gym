@@ -16,15 +16,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import nbformat
 import re
 from asyncio import Semaphore, get_running_loop
 from functools import partial
 from pathlib import Path
 from time import sleep
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import requests
 from judge import (
@@ -33,15 +35,9 @@ from judge import (
     inputs_to_task_text,
     last_assistant_output_text,
     parse_notebook_judge_verdict,
-    redact_execution_for_judge,
-    truncate_for_judge,
 )
 from nbformat.notebooknode import NotebookNode
-from notebook_runtime import (
-    build_notebook_execution_view,
-    run_staging_and_execute,
-    truncate_exec_error,
-)
+from notebook_runtime import run_staging_and_execute, truncate_exec_error
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
@@ -76,12 +72,10 @@ class DataAnalysisNotebookResourcesServerConfig(BaseResourcesServerConfig):
     # When true, skip staging and subprocess execution for reference and predicted code; the judge
     # sees task text, reference source, predicted code, and empty execution signatures only.
     skip_notebook_execution: bool = False
-    image_compare_mode: Literal["exact", "none"] = "exact"
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     judge_endpoint_max_concurrency: int = 32
     judge_prompt_template_fpath: str = "prompt_templates/notebook_task_judge.txt"
-    judge_max_output_chars: int = 12000
     judge_probe_on_startup: bool = True
     executed_notebooks_directory: str = "executed_notebooks"
 
@@ -179,6 +173,65 @@ def _executed_notebook_stem(body: DataAnalysisNotebookVerifyRequest) -> str:
     return "unknown_task"
 
 
+_IMAGE_MIME_EXTENSIONS: tuple[tuple[str, str], ...] = (
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/gif", ".gif"),
+    ("image/webp", ".webp"),
+    ("image/svg+xml", ".svg"),
+)
+_KNOWN_IMAGE_MIMES = {mime for mime, _ in _IMAGE_MIME_EXTENSIONS}
+
+
+def _image_mimes_in_data(data: dict[str, Any]) -> list[str]:
+    mimes = [mime for mime, _ in _IMAGE_MIME_EXTENSIONS if mime in data]
+    mimes.extend(
+        sorted(key for key in data if key.startswith("image/") and key not in _KNOWN_IMAGE_MIMES)
+    )
+    return mimes
+
+
+def _notebook_view_with_external_images(
+    nb: NotebookNode,
+    output_dir: Path,
+    name_prefix: str,
+) -> dict[str, Any]:
+    """Serialize a notebook for the judge, writing image outputs to disk and replacing data with paths."""
+    view = json.loads(nbformat.writes(nb))
+    image_num = 0
+    for cell in view.get("cells") or []:
+        for output in cell.get("outputs") or []:
+            data = output.get("data")
+            if not isinstance(data, dict):
+                continue
+            # Process every image/* mime in this output; counter spans cells and mime types.
+            for mime in _image_mimes_in_data(data):
+                payload = data.pop(mime)
+                # nbformat JSON may store stream-like fields as a list of strings.
+                if isinstance(payload, list):
+                    payload = "".join(str(part) for part in payload)
+                else:
+                    payload = str(payload)
+
+                # Map mime to file suffix; fall back for uncommon image/* keys.
+                ext = next((e for m, e in _IMAGE_MIME_EXTENSIONS if m == mime), None)
+                if ext is None:
+                    if not mime.startswith("image/"):
+                        raise ValueError(f"unsupported image mime: {mime}")
+                    ext = mimetypes.guess_extension(mime, strict=False) or ".bin"
+
+                image_path = output_dir / f"{name_prefix}_image_{image_num}{ext}"
+                # SVG is stored as XML text; other image mimes are base64-encoded bytes.
+                if mime == "image/svg+xml":
+                    image_bytes = payload.encode("utf-8")
+                else:
+                    image_bytes = base64.b64decode(payload)
+                image_path.write_bytes(image_bytes)
+                data[f"{mime}_path"] = f"{output_dir.name}/{image_path.name}"
+                image_num += 1
+    return view
+
+
 class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
     config: DataAnalysisNotebookResourcesServerConfig
 
@@ -232,17 +285,17 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         predicted_execution: dict[str, Any],
     ) -> tuple[Optional[bool], NotebookJudgeEvaluation]:
         # Set up judge prompt from template
-        max_c = self.config.judge_max_output_chars
-        for key, value in (
-            ("{task_text}", task_text),
-            ("{reference_section}", reference_section),
-            ("{predicted_code}", truncate_for_judge(predicted_code, max_c)),
-            (
-                "{predicted_execution_json}",
-                json.dumps(redact_execution_for_judge(predicted_execution, max_c), indent=2, default=str),
+        replacements = {
+            "{task_text}": task_text,
+            "{reference_section}": reference_section,
+            "{predicted_code}": predicted_code,
+            "{predicted_execution_json}": json.dumps(
+                predicted_execution, indent=2, default=str
             ),
-        ):
-            user_prompt = self._judge_prompt_template.replace(key, value)
+        }
+        user_prompt = self._judge_prompt_template
+        for key, value in replacements.items():
+            user_prompt = user_prompt.replace(key, value)
 
         responses_create_params = self.config.judge_responses_create_params.model_copy(deep=True)
         responses_create_params.input = [NeMoGymEasyInputMessage(role="user", content=user_prompt)]
@@ -261,6 +314,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 return None, NotebookJudgeEvaluation(
                     responses_create_params=responses_create_params,
                     verdict_label="judge_error",
+                    reason=str(e),
                 )
 
         # Parse judge response
@@ -313,8 +367,7 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
         )
         timeout = self.config.execute_timeout_secs
         margin = self.config.wall_clock_margin_secs
-        image_mode = self.config.image_compare_mode
-        max_c = self.config.judge_max_output_chars
+        stem = _executed_notebook_stem(body)
 
         ref_nb_executed: Optional[NotebookNode] = None
         pred_nb_executed: Optional[NotebookNode] = None
@@ -329,7 +382,6 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 wall_margin=margin,
             )
             loop = get_running_loop()
-            stem = _executed_notebook_stem(body)
             ref_output_fpath = self._executed_notebooks_dir / f"{stem}_reference.ipynb"
             pred_output_fpath = self._executed_notebooks_dir / f"{stem}_predicted.ipynb"
             async with self._semaphore:
@@ -364,15 +416,17 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
                 )
 
         # Build notebook views and GT reference section for judge
-        ref_view = build_notebook_execution_view(ref_nb, ref_nb_executed, image_mode)
-        pred_view = build_notebook_execution_view(pred_nb, pred_nb_executed, image_mode)
+        ref_view = ref_nb_executed if ref_nb_executed is not None else ref_nb
+        pred_view = pred_nb_executed if pred_nb_executed is not None else pred_nb
+        ref_view = _notebook_view_with_external_images(ref_view, self._executed_notebooks_dir, f"{stem}_reference")
+        pred_view = _notebook_view_with_external_images(pred_view, self._executed_notebooks_dir, f"{stem}_predicted")
 
         if skip_exec:
             reference_section = (
                 "(Ground-truth reference only; notebooks were not executed. "
                 "No runtime outputs. The predicted execution block below is empty. "
                 "Decide PASS/FAIL from the task and cells alone.)\n\n"
-                + json.dumps(redact_execution_for_judge(ref_view, max_c), indent=2, default=str)
+                + json.dumps(ref_view, indent=2, default=str)
             )
         elif ref_err:
             reference_section = (
@@ -383,13 +437,13 @@ class DataAnalysisNotebookResourcesServer(SimpleResourcesServer):
             reference_section = (
                 "(Reference notebook has no code cells, performing verification with no reference.)"            )
         else:
-            reference_section = json.dumps(redact_execution_for_judge(ref_view, max_c), indent=2, default=str)
+            reference_section = json.dumps(ref_view, indent=2, default=str)
 
         # Run LLM judge
         ok, evaluation = await self._run_llm_judge(
             task_text=inputs_to_task_text(body.responses_create_params),
             reference_section=reference_section,
-            predicted_code="\n\n---\n\n".join(c.source for c in pred_nb.cells),
+            predicted_code="\n\n---\n\n".join(c.source for c in pred_nb.cells if c.cell_type == "code"),
             predicted_execution=pred_view,
         )
 

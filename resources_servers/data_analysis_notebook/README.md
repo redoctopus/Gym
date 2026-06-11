@@ -1,12 +1,12 @@
 # Data analysis notebook (resources server)
 
-Verifies single-turn model answers by running **reference** code cells (from a ground-truth notebook) and **predicted** cells (parsed from the model reply) in **separate** temporary working directories and fresh IPython kernels—unless **`skip_notebook_execution`** is enabled (server config or per-request `verifier_metadata`). In skip mode, nothing is executed: the **LLM judge** receives the task, reference cells (code and markdown), predicted code, and empty per-cell execution outputs, and decides whether the prediction fulfills the task from content alone.
+Verifies single-turn model answers by running **reference** code cells (from a ground-truth notebook) and **predicted** cells (parsed from the model reply) in **separate** temporary working directories and fresh IPython kernels—unless **`skip_notebook_execution`** is enabled (server config or per-request `verifier_metadata`). In skip mode, nothing is executed: the **LLM judge** receives the task, reference cells (code and markdown), predicted code, and unexecuted notebook JSON, and decides whether the prediction fulfills the task from content alone.
 
-By default, **per-cell** execution outputs (stdout, stderr, `text/plain`, optional PNG counts per code cell) are sent to the judge together with the task text and predicted code. The judge decides whether the prediction **correctly and completely** satisfies the task, using reference execution output as a guide when it is available (semantic match; not byte-identical output).
+By default, executed notebooks are serialized to **nbformat v4 JSON** (`json.loads(nbformat.writes(...))`) and passed to the judge together with the task text and predicted code. The judge decides whether the prediction **correctly and completely** satisfies the task, using reference execution output as a guide when it is available (semantic match; not byte-identical output).
 
 If the reference notebook fails to execute, verification still runs for the predicted notebook only: the judge does not receive reference output (only the task and predicted code/output).
 
-**Charts / images:** PNG pixel data is **not** sent to the judge (only how many figures were produced per cell). Pixel-level chart equivalence would require a separate vision-capable judge.
+**Charts / images:** Image outputs (`image/png`, `image/jpeg`, `image/svg+xml`, etc.) are written to `executed_notebooks/` as `{stem}_reference|predicted_image_{n}.{ext}` and replaced in the judge JSON with `{mime}_path` pointers. This is done to cut down on judge input length. Text and numeric outputs remain inline.
 
 Reference notebooks preserve **markdown** and **code** cells in order. Only code cells are executed; markdown cells appear in judge input.
 
@@ -36,19 +36,20 @@ print("example")
 ```
 ```
 
-The number of fences **may** differ from the number of reference code cells; the judge sees **per-cell** stdout/stderr and display outputs for each executed predicted code cell (after redaction/truncation for the prompt).
+The number of fences **may** differ from the number of reference code cells; the judge sees predicted code plus the full executed notebook JSON for the predicted run.
 
 Thinking wrappers (`</think>`, `<thinking>...</thinking>`) are removed before parsing fences.
 
 ## Configuration
 
-See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): `skip_notebook_execution` (default `false`), execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), `image_compare_mode` (`exact` | `none`) for PNG inclusion in per-cell output records, and **judge** settings:
+See [`configs/data_analysis_notebook.yaml`](configs/data_analysis_notebook.yaml): `skip_notebook_execution` (default `false`), execution limits (`max_concurrent_executions`, `execute_timeout_secs`, `wall_clock_margin_secs`), and **judge** settings:
 
-- `judge_model_server` — second `responses_api_models` instance (default YAML uses OpenAI-compatible `gpt-4o-mini` via `notebook_judge_model`).
+- `judge_model_server` — second `responses_api_models` instance (default YAML uses OpenAI-compatible `gpt-5-mini` via `notebook_judge_model`).
 - `judge_responses_create_params` — `max_output_tokens` large enough for `VERDICT:` + optional `REASON:`.
 - `judge_prompt_template_fpath` — rubric template under `prompt_templates/`.
-- `judge_max_output_chars` — character limit passed to `truncate_for_judge` for judge prompt text (default `12000`). Applies uniformly to the **PREDICTED CODE** block and to each text field inside the reference/predicted execution JSON (cell sources, stream/plain text, errors). PNG payloads are omitted regardless. This is **not** a total prompt cap: many cells can each contribute up to the limit, and the **TASK** section is not truncated. Long values are cut with a `...[truncated]...` marker.
+- `judge_endpoint_max_concurrency` — max concurrent judge HTTP calls.
 - `judge_probe_on_startup` — wait until the judge `/v1/responses` endpoint is reachable at startup (set `false` in tests).
+- `executed_notebooks_directory` — where executed reference/predicted `.ipynb` files are written when execution is enabled.
 
 Composite runs must include **both** the resources server config and the judge model server config, for example:
 
@@ -62,7 +63,7 @@ The verify response includes `judge_evaluations` with the judge call and parsed 
 
 ## Dependencies
 
-The Jupyter stack (`nbclient`, `ipykernel`, …) is pinned in this server’s `[requirements.txt](requirements.txt)`. `wcwidth` is listed explicitly because some minimal installs omit it and the kernel subprocess then fails to start.
+The Jupyter stack (`nbclient`, `ipykernel`, …) is pinned in this server’s [`requirements.txt`](requirements.txt). `wcwidth` is listed explicitly because some minimal installs omit it and the kernel subprocess then fails to start.
 
 ## Running tests
 

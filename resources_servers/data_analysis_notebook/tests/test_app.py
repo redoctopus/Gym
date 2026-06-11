@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import tempfile
 from pathlib import Path
 from typing import Any, Generator
@@ -25,12 +26,12 @@ from app import (
     DataAnalysisNotebookResourcesServerConfig,
     DataAnalysisNotebookVerifyRequest,
     DataAnalysisNotebookVerifyResponse,
+    _notebook_view_with_external_images,
     extract_predicted_notebook,
 )
 from fastapi.testclient import TestClient
-from judge import parse_notebook_judge_verdict, redact_execution_for_judge
+from judge import parse_notebook_judge_verdict
 from nbformat.v4 import new_output
-from notebook_runtime import build_notebook_execution_view
 from pydantic import ValidationError
 
 from nemo_gym.config_types import ModelServerRef
@@ -177,9 +178,8 @@ class TestExtractPredictedNotebook:
         assert extract_predicted_notebook(src).cells == []
 
 
-class TestNotebookExecutionView:
-    def test_two_code_cells_stay_separate(self) -> None:
-        source_nb = _code_notebook("x", "y")
+class TestNotebookJsonForJudge:
+    def test_nbformat_writes_produces_serializable_dict(self) -> None:
         executed_nb = nbformat.v4.new_notebook()
         c1 = nbformat.v4.new_code_cell("x")
         c1.outputs = [new_output("stream", name="stdout", text="1\n")]
@@ -187,62 +187,78 @@ class TestNotebookExecutionView:
         c2.outputs = [new_output("stream", name="stdout", text="2\n")]
         executed_nb.cells = [c1, c2]
 
-        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
+        view = json.loads(nbformat.writes(executed_nb))
         assert len(view["cells"]) == 2
-        assert view["cells"][0]["outputs"][0]["text"] == "1"
-        assert view["cells"][1]["outputs"][0]["text"] == "2"
+        assert view["cells"][0]["outputs"][0]["text"] == ["1\n"]
+        assert view["cells"][1]["outputs"][0]["text"] == ["2\n"]
 
-    def test_markdown_cells_preserved_in_view(self) -> None:
-        source_nb = nbformat.v4.new_notebook()
-        source_nb.cells = [nbformat.v4.new_markdown_cell("# Title"), nbformat.v4.new_code_cell("print(1)")]
+    def test_markdown_cells_preserved_in_json(self) -> None:
         executed_nb = nbformat.v4.new_notebook()
         executed_code = nbformat.v4.new_code_cell("print(1)")
         executed_code.outputs = [new_output("stream", name="stdout", text="1\n")]
         executed_nb.cells = [nbformat.v4.new_markdown_cell("# Title"), executed_code]
 
-        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
+        view = json.loads(nbformat.writes(executed_nb))
         assert view["cells"][0]["cell_type"] == "markdown"
-        assert view["cells"][1]["outputs"][0]["text"] == "1"
+        assert view["cells"][1]["outputs"][0]["text"] == ["1\n"]
 
-    def test_stderr_and_stdout_are_separate_output_records(self) -> None:
-        source_nb = _code_notebook("x")
-        executed_nb = nbformat.v4.new_notebook()
-        c = nbformat.v4.new_code_cell("x")
-        c.outputs = [
-            new_output("stream", name="stdout", text="a\n"),
-            new_output("stream", name="stderr", text="b\n"),
+    def test_unexecuted_notebook_has_no_outputs(self) -> None:
+        view = json.loads(nbformat.writes(_code_notebook("print(1)", "x = 2")))
+        assert all(cell.get("outputs", []) == [] for cell in view["cells"])
+
+
+class TestExternalizeNotebookImages:
+    _TINY_PNG_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    def test_writes_png_and_replaces_inline_data(self, tmp_path: Path) -> None:
+        nb = nbformat.v4.new_notebook()
+        cell = nbformat.v4.new_code_cell("x")
+        cell.outputs = [new_output("display_data", data={"image/png": self._TINY_PNG_B64})]
+        nb.cells = [cell]
+
+        view = _notebook_view_with_external_images(nb, tmp_path, "task_0_rollout_0_predicted")
+        image_path = tmp_path / "task_0_rollout_0_predicted_image_0.png"
+        assert image_path.exists()
+        data = view["cells"][0]["outputs"][0]["data"]
+        assert data["image/png_path"] == f"{tmp_path.name}/task_0_rollout_0_predicted_image_0.png"
+        assert "image/png" not in data
+
+    def test_image_numbers_increment_in_order(self, tmp_path: Path) -> None:
+        nb = nbformat.v4.new_notebook()
+        c1 = nbformat.v4.new_code_cell("a")
+        c1.outputs = [new_output("display_data", data={"image/png": self._TINY_PNG_B64})]
+        c2 = nbformat.v4.new_code_cell("b")
+        c2.outputs = [new_output("display_data", data={"image/png": self._TINY_PNG_B64})]
+        nb.cells = [c1, c2]
+
+        _notebook_view_with_external_images(nb, tmp_path, "task_1_rollout_0_reference")
+        assert (tmp_path / "task_1_rollout_0_reference_image_0.png").exists()
+        assert (tmp_path / "task_1_rollout_0_reference_image_1.png").exists()
+
+    def test_multiple_mimes_in_one_output_share_counter(self, tmp_path: Path) -> None:
+        nb = nbformat.v4.new_notebook()
+        cell = nbformat.v4.new_code_cell("x")
+        cell.outputs = [
+            new_output(
+                "display_data",
+                data={
+                    "image/png": self._TINY_PNG_B64,
+                    "image/svg+xml": '<svg xmlns="http://www.w3.org/2000/svg"/>',
+                },
+            )
         ]
-        executed_nb.cells = [c]
-        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
-        outputs = view["cells"][0]["outputs"]
-        assert outputs[0]["name"] == "stdout"
-        assert outputs[0]["text"] == "a"
-        assert outputs[1]["name"] == "stderr"
-        assert outputs[1]["text"] == "b"
+        nb.cells = [cell]
 
-    def test_stdout_and_plain_stay_separate_output_records(self) -> None:
-        source_nb = _code_notebook("x")
-        executed_nb = nbformat.v4.new_notebook()
-        c = nbformat.v4.new_code_cell("x")
-        c.outputs = [
-            new_output("stream", name="stdout", text="printed\n"),
-            {
-                "output_type": "execute_result",
-                "data": {"text/plain": "repr_value"},
-                "metadata": {},
-                "execution_count": 1,
-            },
-        ]
-        executed_nb.cells = [c]
-        view = build_notebook_execution_view(source_nb, executed_nb, "exact")
-        outputs = view["cells"][0]["outputs"]
-        assert outputs[0]["kind"] == "stream"
-        assert outputs[1]["kind"] == "plain"
-        assert outputs[1]["text"] == "repr_value"
-
-    def test_skip_mode_empty_outputs(self) -> None:
-        view = build_notebook_execution_view(_code_notebook("print(1)", "x = 2"), None, "exact")
-        assert all(cell["outputs"] == [] for cell in view["cells"])
+        view = _notebook_view_with_external_images(nb, tmp_path, "task_2_rollout_0_predicted")
+        assert (tmp_path / "task_2_rollout_0_predicted_image_0.png").exists()
+        assert (tmp_path / "task_2_rollout_0_predicted_image_1.svg").exists()
+        data = view["cells"][0]["outputs"][0]["data"]
+        assert data["image/png_path"].endswith("_image_0.png")
+        assert data["image/svg+xml_path"].endswith("_image_1.svg")
+        assert "image/png" not in data
+        assert "image/svg+xml" not in data
 
 
 @pytest.fixture
@@ -273,27 +289,6 @@ class TestParseJudgeVerdict:
     def test_empty(self) -> None:
         ok, label, _ = parse_notebook_judge_verdict("")
         assert ok is None and label == "judge_parsing_error"
-
-
-class TestRedactExecutionForJudge:
-    def test_pngs_become_summary(self) -> None:
-        view = {
-            "cells": [
-                {
-                    "cell_type": "code",
-                    "source": "x",
-                    "outputs": [
-                        {"kind": "plain", "text": "a"},
-                        {"kind": "png", "data": "aaa"},
-                        {"kind": "png", "data": "bbb"},
-                    ],
-                }
-            ]
-        }
-        out = redact_execution_for_judge(view, 1000)
-        assert "2 PNG figure" in out["png_summary"]
-        outputs = out["cells"][0]["outputs"]
-        assert all(rec.get("kind") != "png" or rec.get("omitted") for rec in outputs)
 
 
 class TestVerifyIntegration:
