@@ -4,7 +4,7 @@ notebook_judge_model:
       entrypoint: app.py
       openai_base_url: ${policy_base_url}
       openai_api_key: ${policy_api_key}
-      openai_model: openai/openai/gpt-5-mini  # nvidia/qwen/qwen3.6-35b-a3b
+      openai_model: nvidia/qwen/qwen3.6-35b-a3b  # openai/openai/gpt-5-mini
 
 data_analysis_notebook:
   resources_servers:
@@ -23,8 +23,8 @@ data_analysis_notebook:
         name: notebook_judge_model
       judge_responses_create_params:
         input: []
-        max_output_tokens: 1024
-        #temperature: 0.7
+        max_output_tokens: 2048
+        temperature: 0.7
       judge_endpoint_max_concurrency: 32
       judge_prompt_template_fpath: prompt_templates/notebook_task_judge.txt
       judge_probe_on_startup: true

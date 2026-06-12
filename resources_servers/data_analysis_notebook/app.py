@@ -216,8 +216,6 @@ def _notebook_view_with_external_images(
                 # Map mime to file suffix; fall back for uncommon image/* keys.
                 ext = next((e for m, e in _IMAGE_MIME_EXTENSIONS if m == mime), None)
                 if ext is None:
-                    if not mime.startswith("image/"):
-                        raise ValueError(f"unsupported image mime: {mime}")
                     ext = mimetypes.guess_extension(mime, strict=False) or ".bin"
 
                 image_path = output_dir / f"{name_prefix}_image_{image_num}{ext}"
